@@ -1,0 +1,11 @@
+# ~/.codex/config.toml fragment
+# Codex spawns this bridge as a stdio MCP server per session.
+
+[mcp_servers.devin]
+command = "node"
+args = ["/home/duro/Projects/devin_subagents/dist/index.js"]
+
+# Optional env passed to the bridge:
+# env = { DEVIN_MODEL = "swe-2-max",          # pinned model for `devin acp`
+#         DEVIN_SUBAGENT_PERMISSION = "auto",  # auto | always | operator
+#         DEVIN_SUBAGENT_MODE = "smart" }      # applied per session/new (default: smart)

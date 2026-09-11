@@ -1,0 +1,25 @@
+{
+  "name": "devin-subagents",
+  "version": "0.1.0",
+  "description": "Expose `devin acp` sessions as lifecycle-managed subagents over MCP (spawn / poll / send / interrupt / resume).",
+  "type": "module",
+  "bin": {
+    "devin-subagents": "dist/index.js"
+  },
+  "scripts": {
+    "build": "tsc",
+    "start": "node dist/index.js",
+    "smoke": "node scripts/handshake.mjs"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "1.30.0",
+    "zod": "3.25.76"
+  },
+  "devDependencies": {
+    "typescript": "7.0.2",
+    "@types/node": "^24.0.0"
+  }
+}
