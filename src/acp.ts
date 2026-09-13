@@ -25,16 +25,25 @@ interface PendingCall {
   resolve: (v: Json) => void;
   reject: (e: Error) => void;
   method: string;
+  timer?: NodeJS.Timeout;
 }
 
 export interface AcpClientOptions {
-  bin: string;
+  command: string;
   args: string[];
   cwd: string;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Max wait for a non-prompt RPC response (initialize, session/new,
+   * session/load, session/list, session/set_mode, ...). session/prompt is
+   * deliberately unbounded: a turn may legitimately run for many minutes.
+   * 0 disables timeouts entirely.
+   */
+  rpcTimeoutMs?: number;
 }
 
 const PROTOCOL_VERSION = 1;
+const DEFAULT_RPC_TIMEOUT_MS = 30_000;
 
 /**
  * Minimal ACP (Agent Client Protocol) client over stdio NDJSON.
@@ -44,6 +53,9 @@ const PROTOCOL_VERSION = 1;
  * no fs/terminal client capabilities, so the agent performs file edits and
  * shell commands in-process; the only agent->client request expected is
  * `session/request_permission`.
+ *
+ * The client self-heals: after the child exits or a start attempt fails, the
+ * next ensureStarted() spawns a fresh process and redoes initialize.
  */
 export class AcpClient {
   onSessionUpdate?: (u: SessionUpdate) => void;
@@ -61,16 +73,30 @@ export class AcpClient {
 
   constructor(private opts: AcpClientOptions) {}
 
-  /** Lazily spawn `devin acp` and complete the initialize handshake once. */
+  /**
+   * Lazily spawn `devin acp` and complete the initialize handshake.
+   * Safe to call concurrently; respawns the agent after exit or a failed
+   * previous attempt instead of returning a stale settled promise.
+   */
   async ensureStarted(): Promise<void> {
-    if (this.starting) return this.starting;
-    this.starting = this.doStart();
-    return this.starting;
+    if (this.starting && this.child && !this.exited) return this.starting;
+    const p = this.doStart();
+    this.starting = p;
+    try {
+      await p;
+    } catch (e) {
+      // Do not cache a failed start: the next caller must retry with a
+      // fresh process rather than reawait a dead promise.
+      if (this.starting === p) this.starting = undefined;
+      throw e;
+    }
   }
 
   private async doStart(): Promise<void> {
+    this.rl?.removeAllListeners();
+    this.rl?.close();
     this.exited = false;
-    const child = spawn(this.opts.bin, this.opts.args, {
+    const child = spawn(this.opts.command, this.opts.args, {
       cwd: this.opts.cwd,
       env: { ...process.env, ...this.opts.env },
       stdio: ["pipe", "pipe", "pipe"],
@@ -82,26 +108,52 @@ export class AcpClient {
         if (line.trim()) this.onLog?.(line);
       }
     });
+    // stdin 'error' (EPIPE etc.) must be handled or it would throw
+    // asynchronously; the subsequent 'exit' performs the real cleanup.
+    child.stdin?.on("error", (err) => {
+      this.onLog?.(`acp stdin: ${err.message}`);
+    });
+    // Handlers are bound to THIS child: a previous incarnation's late
+    // error/exit must never poison the new process's state.
     child.on("error", (err) => {
-      this.failAll(new Error(`failed to spawn ${this.opts.bin}: ${err.message}`));
+      if (child !== this.child) return;
+      this.failAll(
+        new Error(`failed to spawn ${this.opts.command}: ${err.message}`),
+      );
     });
     child.on("exit", (code) => {
+      if (child !== this.child) return;
       this.exited = true;
-      this.failAll(new Error(`devin acp exited with code ${code}`));
+      this.failAll(new Error(`agent process exited with code ${code}`));
       this.onAgentExit?.(code);
     });
 
     this.rl = createInterface({ input: child.stdout!, terminal: false });
     this.rl.on("line", (line) => this.handleLine(line));
 
-    await this.call("initialize", {
-      protocolVersion: PROTOCOL_VERSION,
-      clientCapabilities: {
-        fs: { readTextFile: false, writeTextFile: false },
-        terminal: false,
-      },
-      clientInfo: { name: "devin-subagents", version: "0.1.0" },
-    });
+    try {
+      await this.call(
+        "initialize",
+        {
+          protocolVersion: PROTOCOL_VERSION,
+          clientCapabilities: {
+            fs: { readTextFile: false, writeTextFile: false },
+            terminal: false,
+          },
+          clientInfo: { name: "devin-subagents", version: "0.5.0" },
+        },
+        this.timeoutMs(),
+      );
+    } catch (e) {
+      // A process that cannot finish initialize is wedged; drop it so the
+      // next ensureStarted starts clean rather than reusing a broken pipe.
+      try {
+        child.kill("SIGKILL");
+      } catch {
+        /* already gone */
+      }
+      throw e;
+    }
   }
 
   isAlive(): boolean {
@@ -119,26 +171,62 @@ export class AcpClient {
   // ---- ACP agent methods ----
 
   newSession(cwd: string): Promise<Json> {
-    return this.call("session/new", { cwd, mcpServers: [] });
+    return this.call("session/new", { cwd, mcpServers: [] }, this.timeoutMs());
   }
 
   loadSession(sessionId: string, cwd: string): Promise<Json> {
-    return this.call("session/load", { sessionId, cwd, mcpServers: [] });
+    return this.call(
+      "session/load",
+      { sessionId, cwd, mcpServers: [] },
+      this.timeoutMs(),
+    );
   }
 
   listSessions(cwd?: string): Promise<Json> {
-    return this.call("session/list", cwd ? { cwd } : {});
+    return this.call("session/list", cwd ? { cwd } : {}, this.timeoutMs());
   }
 
-  setMode(sessionId: string, modeId: string): Promise<Json> {
-    return this.call("session/set_mode", { sessionId, modeId });
+  /**
+   * session/set_mode. Some agents (devin) route config through
+   * set_config_option instead — on "method not found" we retry that way
+   * with configId "mode".
+   */
+  async setMode(sessionId: string, modeId: string): Promise<Json> {
+    try {
+      return await this.call(
+        "session/set_mode",
+        { sessionId, modeId },
+        this.timeoutMs(),
+      );
+    } catch (e) {
+      if (e instanceof Error && /method not found|unknown method/i.test(e.message)) {
+        return this.setConfigOption(sessionId, "mode", modeId);
+      }
+      throw e;
+    }
   }
 
-  setModel(sessionId: string, modelId: string): Promise<Json> {
-    return this.call("session/set_model", { sessionId, modelId });
+  /**
+   * session/set_config_option — the verified way devin applies model
+   * selection ({configId:"model", value:"swe-2-high"}; the response echoes
+   * configOptions with the confirmed currentValue).
+   */
+  setConfigOption(
+    sessionId: string,
+    configId: string,
+    value: string,
+  ): Promise<Json> {
+    return this.call(
+      "session/set_config_option",
+      { sessionId, configId, value },
+      this.timeoutMs(),
+    );
   }
 
-  /** Resolves with { stopReason } when the turn ends. */
+  /**
+   * Resolves with { stopReason } when the turn ends. Intentionally has no
+   * RPC timeout — a turn can legitimately run for a very long time.
+   */
   prompt(sessionId: string, text: string): Promise<Json> {
     return this.call("session/prompt", {
       sessionId,
@@ -168,37 +256,56 @@ export class AcpClient {
 
   // ---- transport ----
 
-  private call(method: string, params: Json): Promise<Json> {
-    if (!this.child?.stdin?.writable) {
-      return Promise.reject(new Error("devin acp is not running"));
+  private timeoutMs(): number | undefined {
+    const t = this.opts.rpcTimeoutMs ?? DEFAULT_RPC_TIMEOUT_MS;
+    return t > 0 ? t : undefined;
+  }
+
+  private call(method: string, params: Json, timeoutMs?: number): Promise<Json> {
+    if (!this.child?.stdin?.writable || this.exited) {
+      return Promise.reject(new Error("agent process is not running"));
     }
     const id = ++this.seq;
     const msg = { jsonrpc: "2.0", id, method, params };
     return new Promise<Json>((resolve, reject) => {
-      this.pending.set(id, { resolve, reject, method });
-      this.child!.stdin!.write(JSON.stringify(msg) + "\n");
+      const p: PendingCall = { resolve, reject, method };
+      if (timeoutMs) {
+        p.timer = setTimeout(() => {
+          this.pending.delete(id);
+          reject(new Error(`${method} timed out after ${timeoutMs}ms`));
+        }, timeoutMs);
+      }
+      this.pending.set(id, p);
+      try {
+        this.child!.stdin!.write(JSON.stringify(msg) + "\n");
+      } catch (e) {
+        if (p.timer) clearTimeout(p.timer);
+        this.pending.delete(id);
+        reject(e instanceof Error ? e : new Error(String(e)));
+      }
     });
   }
 
+  private write(msg: Json): void {
+    try {
+      if (this.child?.stdin?.writable) {
+        this.child.stdin.write(JSON.stringify(msg) + "\n");
+      }
+    } catch {
+      /* peer is gone; callers surface errors via the request path */
+    }
+  }
+
   private notify(method: string, params: Json): void {
-    if (!this.child?.stdin?.writable) return;
-    this.child.stdin.write(
-      JSON.stringify({ jsonrpc: "2.0", method, params }) + "\n",
-    );
+    this.write({ jsonrpc: "2.0", method, params });
   }
 
   private respond(id: number | string, result: Json): void {
-    if (!this.child?.stdin?.writable) return;
-    this.child.stdin.write(
-      JSON.stringify({ jsonrpc: "2.0", id, result }) + "\n",
-    );
+    this.write({ jsonrpc: "2.0", id, result });
   }
 
   private respondError(id: number | string, code: number, message: string): void {
-    if (!this.child?.stdin?.writable) return;
-    this.child.stdin.write(
-      JSON.stringify({ jsonrpc: "2.0", id, error: { code, message } }) + "\n",
-    );
+    this.write({ jsonrpc: "2.0", id, error: { code, message } });
   }
 
   private handleLine(line: string): void {
@@ -221,6 +328,7 @@ export class AcpClient {
       const p = this.pending.get(msg.id as number);
       if (!p) return;
       this.pending.delete(msg.id as number);
+      if (p.timer) clearTimeout(p.timer);
       if (msg.error) {
         const e = msg.error as { code?: number; message?: string };
         p.reject(new Error(`${p.method} failed: ${e.message ?? JSON.stringify(e)}`));
@@ -262,10 +370,11 @@ export class AcpClient {
   }
 
   private failAll(err: Error): void {
-    for (const p of this.pending.values()) p.reject(err);
-    this.pending.clear();
-    for (const req of this.permissionRequests.values()) {
-      this.permissionRequests.delete(req.requestId);
+    for (const p of this.pending.values()) {
+      if (p.timer) clearTimeout(p.timer);
+      p.reject(err);
     }
+    this.pending.clear();
+    this.permissionRequests.clear();
   }
 }

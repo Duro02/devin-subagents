@@ -1,8 +1,14 @@
 import { readFileSync, writeFileSync, renameSync, existsSync } from "node:fs";
 import type { Json, PermissionRequest } from "./acp.js";
+import {
+  createObservation,
+  recordObservation,
+  type Observation,
+} from "./observe.js";
 
 export type SubStatus =
-  | "running" // a prompt turn is in flight
+  | "starting" // claimed name, session/new (or session/load) in flight
+  | "running" // a prompt turn is in flight (or queued turns remain)
   | "idle" // session exists, waiting between turns
   | "stopped" // interrupted or finished, kept for resume
   | "dead"; // agent process exited; resumable via session/load
@@ -16,40 +22,69 @@ export interface BufferedEvent {
 
 export interface SubSession {
   name: string;
-  sessionId: string;
+  sessionId: string; // "" while status === "starting"
   cwd: string;
   status: SubStatus;
   createdAt: string;
   events: BufferedEvent[];
   head: number; // seq of the newest event (cursor for incremental poll)
-  readCursor: number; // seq consumed by the last devin_poll
+  readCursor: number; // seq consumed by the last poll
   lastStopReason?: string;
+  /** persistent inspect snapshot state — survives drains and eviction */
+  obs: Observation;
+  turnSeq: number; // total turns started (1-based turn ids)
+  activeTurn: number; // turn id currently in flight, 0 = none
+  queue: string[]; // FIFO of prompt texts waiting for the active turn
+  availableModes?: string[];
+  currentMode?: string;
+  availableModels?: string[];
+  currentModel?: string;
+  /** a set_mode/set_model RPC is in flight — prompts must not start */
+  configuring: boolean;
   pendingPermission?: {
     requestId: number | string;
     toolCall: Json;
     options: { optionId: string; name: string; kind: string }[];
   };
-  notify?: () => void; // resolves a waiting devin_poll early
+  waiters: Set<() => void>; // waiting poll callers to wake on change
 }
 
 interface StateFile {
-  sessions: Record<string, { sessionId: string; cwd: string }>;
+  sessions: Record<
+    string,
+    { sessionId: string; cwd: string; mode?: string; model?: string }
+  >;
 }
 
-const BUFFER_CAP = Number(process.env.DEVIN_SUBAGENT_BUFFER ?? 500);
+export interface RegistryOptions {
+  bufferCap?: number;
+  onLog?: (line: string) => void;
+}
 
 export class Registry {
   private sessions = new Map<string, SubSession>();
+  private bufferCap: number;
+  private onLog?: (line: string) => void;
 
-  constructor(private statePath: string) {}
+  constructor(private statePath: string, opts: RegistryOptions = {}) {
+    const cap = opts.bufferCap ?? 500;
+    this.bufferCap = Number.isFinite(cap) && cap >= 1 ? Math.floor(cap) : 500;
+    this.onLog = opts.onLog;
+  }
 
-  /** sessionIds persisted by earlier bridge runs, for `devin_resume`. */
-  persisted(): Record<string, { sessionId: string; cwd: string }> {
+  /** sessions persisted by earlier bridge runs, for `resume`. */
+  persisted(): Record<
+    string,
+    { sessionId: string; cwd: string; mode?: string; model?: string }
+  > {
     try {
       if (!existsSync(this.statePath)) return {};
       const raw = JSON.parse(readFileSync(this.statePath, "utf8")) as StateFile;
       return raw.sessions ?? {};
-    } catch {
+    } catch (e) {
+      this.onLog?.(
+        `state: cannot read ${this.statePath}: ${e instanceof Error ? e.message : e}`,
+      );
       return {};
     }
   }
@@ -62,27 +97,57 @@ export class Registry {
     return [...this.sessions.keys()];
   }
 
-  register(name: string, sessionId: string, cwd: string): SubSession {
+  /**
+   * Synchronously reserve a name before any await, so two concurrent
+   * spawn/resume calls can never both win it.
+   */
+  claim(name: string): SubSession {
+    if (this.sessions.has(name)) {
+      throw new Error(`subagent "${name}" already exists`);
+    }
     const s: SubSession = {
       name,
-      sessionId,
-      cwd,
-      status: "idle",
+      sessionId: "",
+      cwd: "",
+      status: "starting",
       createdAt: new Date().toISOString(),
       events: [],
       head: 0,
       readCursor: 0,
+      obs: createObservation(),
+      turnSeq: 0,
+      activeTurn: 0,
+      queue: [],
+      configuring: false,
+      waiters: new Set(),
     };
     this.sessions.set(name, s);
+    return s;
+  }
+
+  /** Fill in a claimed session once session/new|load returned. */
+  activate(name: string, sessionId: string, cwd: string): SubSession {
+    const s = this.sessions.get(name);
+    if (!s) throw new Error(`subagent "${name}" was released`);
+    s.sessionId = sessionId;
+    s.cwd = cwd;
+    s.status = "idle";
     this.persist();
     return s;
   }
 
-  /** Re-attach a persisted sessionId after a fresh session/load. */
-  revive(name: string, sessionId: string, cwd: string): SubSession {
-    const s = this.register(name, sessionId, cwd);
-    s.status = "idle";
-    return s;
+  /**
+   * Drop a claimed/registered session (spawn or resume failed).
+   * `forget` also removes the name from the persisted state file — used
+   * when a half-created session should not linger as resumable.
+   */
+  release(name: string, forget = false): void {
+    const s = this.sessions.get(name);
+    if (s) {
+      for (const w of s.waiters) w();
+      this.sessions.delete(name);
+    }
+    if (forget) this.persist(new Set([name]));
   }
 
   mark(name: string, status: SubStatus, stopReason?: string): void {
@@ -90,23 +155,35 @@ export class Registry {
     if (!s) return;
     s.status = status;
     if (stopReason !== undefined) s.lastStopReason = stopReason;
+    for (const w of s.waiters) w();
   }
 
-  markAllDead(): void {
+  markAllDead(code?: number | null): void {
     for (const s of this.sessions.values()) {
-      if (s.status === "running" || s.status === "idle") s.status = "dead";
+      if (s.status === "dead") continue;
+      const droppedQueue = s.queue.length;
+      s.status = "dead";
+      s.activeTurn = 0;
+      s.queue = [];
+      s.pendingPermission = undefined;
+      this.append(s.name, "agent_exit", { code, droppedQueue });
+      for (const w of s.waiters) w();
     }
   }
 
   append(name: string, kind: string, data: Json): void {
     const s = this.sessions.get(name);
     if (!s) return;
+    const at = new Date().toISOString();
     s.head += 1;
-    s.events.push({ seq: s.head, at: new Date().toISOString(), kind, data });
-    if (s.events.length > BUFFER_CAP) {
-      s.events.splice(0, s.events.length - BUFFER_CAP);
+    s.events.push({ seq: s.head, at, kind, data });
+    if (s.events.length > this.bufferCap) {
+      s.events.splice(0, s.events.length - this.bufferCap);
     }
-    s.notify?.();
+    // the inspect snapshot tracks every event — it must not depend on the
+    // ring buffer (eviction) or on any caller's read cursor (consumption)
+    recordObservation(s.obs, kind, data, at, s);
+    for (const w of s.waiters) w();
   }
 
   setPermission(name: string, req: PermissionRequest): void {
@@ -117,7 +194,7 @@ export class Registry {
       toolCall: req.toolCall,
       options: req.options,
     };
-    s.notify?.();
+    for (const w of s.waiters) w();
   }
 
   clearPermission(name: string): void {
@@ -126,58 +203,92 @@ export class Registry {
   }
 
   /**
-   * Events with seq > since (or since the last poll when since is omitted).
-   * Also advances the read cursor.
+   * Events with seq > since (or since the last logs poll when since is
+   * omitted), capped at `limit` raw events when given.
+   * An explicit `since` is a replay and does NOT move the stored read
+   * cursor; a cursor-less poll advances readCursor only to `nextCursor`
+   * (the last event actually returned), so a bounded page never silently
+   * skips unconsumed records.
+   * `dropped` = events the caller asked for that were evicted from the ring
+   * buffer: seqs in (from, oldest).
    */
   drain(
     name: string,
-    since?: number,
-  ): { events: BufferedEvent[]; cursor: number; dropped: number } | undefined {
+    opts: { since?: number; limit?: number } = {},
+  ):
+    | {
+        events: BufferedEvent[];
+        cursor: number;
+        nextCursor: number;
+        hasMore: boolean;
+        dropped: number;
+      }
+    | undefined {
     const s = this.sessions.get(name);
     if (!s) return undefined;
+    const { since, limit } = opts;
     const from = since ?? s.readCursor;
-    const events = s.events.filter((e) => e.seq > from);
-    s.readCursor = s.head;
-    const oldest = s.events[0]?.seq ?? 0;
-    const dropped = Math.max(0, Math.min(from, oldest - 1));
-    return { events, cursor: s.head, dropped };
+    let events = s.events.filter((e) => e.seq > from);
+    if (limit !== undefined && events.length > limit) {
+      events = events.slice(0, limit);
+    }
+    const nextCursor = events.length ? events[events.length - 1].seq : from;
+    const hasMore =
+      s.events.length > 0 && s.events[s.events.length - 1].seq > nextCursor;
+    if (since === undefined) s.readCursor = nextCursor;
+    const oldest = s.events.length ? s.events[0].seq : s.head + 1;
+    const dropped = Math.max(0, oldest - 1 - from);
+    return { events, cursor: s.head, nextCursor, hasMore, dropped };
   }
 
   /**
    * Wait until a new event arrives for `name` or `ms` elapses.
+   * Any number of polls may wait concurrently; each is woken independently.
    * Resolves false on timeout, true if woken by an event.
    */
   waitForEvent(name: string, ms: number): Promise<boolean> {
     const s = this.sessions.get(name);
     if (!s || ms <= 0) return Promise.resolve(false);
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        s.notify = undefined;
-        resolve(false);
-      }, ms);
-      s.notify = () => {
+      const cb = () => {
         clearTimeout(timer);
-        s.notify = undefined;
+        s.waiters.delete(cb);
         resolve(true);
       };
+      const timer = setTimeout(() => {
+        s.waiters.delete(cb);
+        resolve(false);
+      }, ms);
+      s.waiters.add(cb);
     });
   }
 
-  persist(): void {
+  persist(except?: Set<string>): void {
     const sessions: StateFile["sessions"] = {};
     for (const s of this.sessions.values()) {
-      sessions[s.name] = { sessionId: s.sessionId, cwd: s.cwd };
+      // mode/model ride along so a cross-bridge resume can re-assert the
+      // session's own selection instead of the bridge's defaults.
+      if (s.sessionId) {
+        sessions[s.name] = {
+          sessionId: s.sessionId,
+          cwd: s.cwd,
+          ...(s.currentMode ? { mode: s.currentMode } : {}),
+          ...(s.currentModel ? { model: s.currentModel } : {}),
+        };
+      }
     }
     // merge in sessions known from earlier runs but not loaded this time
     for (const [name, v] of Object.entries(this.persisted())) {
-      sessions[name] ??= v;
+      if (!except?.has(name)) sessions[name] ??= v;
     }
     const tmp = this.statePath + ".tmp";
     try {
       writeFileSync(tmp, JSON.stringify({ sessions }, null, 2));
       renameSync(tmp, this.statePath);
-    } catch {
-      /* state file is best-effort; resume also works via devin_list */
+    } catch (e) {
+      this.onLog?.(
+        `state: cannot write ${this.statePath}: ${e instanceof Error ? e.message : e}`,
+      );
     }
   }
 }
