@@ -5,7 +5,10 @@
 command = "node"
 args = ["/home/duro/Projects/devin_subagents/dist/index.js"]
 
-# Optional env passed to the bridge:
-# env = { DEVIN_MODEL = "swe-2-max",          # pinned model for `devin acp`
-#         DEVIN_SUBAGENT_PERMISSION = "auto",  # auto | always | operator
-#         DEVIN_SUBAGENT_MODE = "smart" }      # applied per session/new (default: smart)
+# Optional: copy devin-subagents.config.example.json to
+# devin-subagents.config.json, edit it, and point the bridge at it:
+# args = ["/home/duro/Projects/devin_subagents/dist/index.js",
+#         "--config", "/home/duro/Projects/devin_subagents/devin-subagents.config.json"]
+#
+# No env block is needed — the bridge reads no DEVIN_* variables.
+# See devin-subagents.config.example.json / README for the config keys.

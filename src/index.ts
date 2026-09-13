@@ -1,28 +1,38 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
 import { z } from "zod";
-import { Controller } from "./controller.js";
+import { Controller, type ControllerConfig } from "./controller.js";
+import { loadBridgeConfig, USAGE } from "./config.js";
 
-const cfg = {
-  bin: process.env.DEVIN_BIN ?? "devin",
-  args: (process.env.DEVIN_ACP_ARGS ?? "acp").split(" ").filter(Boolean),
-  cwd: process.cwd(),
-  env: process.env.DEVIN_MODEL ? { DEVIN_MODEL: process.env.DEVIN_MODEL } : {},
-  statePath:
-    process.env.DEVIN_SUBAGENT_STATE ??
-    `${process.cwd()}/.devin-subagents.json`,
-  permissionPolicy: (process.env.DEVIN_SUBAGENT_PERMISSION ??
-    "auto") as "auto" | "always" | "operator",
-  // Subagents default to smart mode: workspace edits auto-approve and a fast
-  // model auto-runs clearly-safe actions; riskier ones still come back as
-  // permission requests (see DEVIN_SUBAGENT_PERMISSION for how we answer).
-  defaultMode: process.env.DEVIN_SUBAGENT_MODE ?? "smart",
-};
+function loadConfig(): ControllerConfig {
+  const { config, file, specified, help } = loadBridgeConfig(
+    process.argv.slice(2),
+  );
+  if (help) {
+    process.stdout.write(USAGE);
+    process.exit(0);
+  }
+  if (file) process.stderr.write(`devin-subagents: config ${file}\n`);
+  return {
+    ...config,
+    cwd: process.cwd(),
+    // Values written in the config file are deliberate: fail a spawn whose
+    // configured mode isn't advertised, rather than silently running a
+    // different config. Built-in defaults degrade to *_skipped events.
+    // Models always require exact agent confirmation at spawn.
+    modeStrict: specified.has("mode"),
+    onLog: (line) => process.stderr.write(`[devin] ${line}\n`),
+  };
+}
 
-const ctl = new Controller(cfg);
+let ctl: Controller;
+let cfg: ControllerConfig;
 
 const ok = (v: unknown) => ({
   content: [{ type: "text" as const, text: JSON.stringify(v, null, 2) }],
+  ...(v !== null && typeof v === "object" && !Array.isArray(v)
+    ? { structuredContent: v as Record<string, unknown> }
+    : {}),
 });
 const fail = (e: unknown) => ({
   isError: true,
@@ -38,133 +48,177 @@ const run = async (f: () => Promise<unknown> | unknown) => {
   }
 };
 
+const nameParam = z
+  .string()
+  .describe("Subagent handle returned by spawn, e.g. 'coder-auth'");
+
 const server = new McpServer({
   name: "devin-subagents",
-  version: "0.1.0",
+  version: "0.5.0",
 });
 
 server.registerTool(
-  "devin_spawn",
+  "spawn",
   {
     title: "Spawn a Devin subagent",
     description:
       "Create a new Devin session and start it on a task in the background. " +
-      "Returns immediately; use devin_poll to watch progress. Multiple subagents can run in parallel.",
+      "Returns immediately; use poll to watch progress. Multiple subagents can run in parallel.",
     inputSchema: {
       name: z
         .string()
-        .describe("Unique handle for this subagent, e.g. 'coder-auth'"),
-      task: z.string().describe("The task prompt for the subagent"),
+        .min(1)
+        .max(64)
+        .describe("Unique handle for this subagent ([A-Za-z0-9._-])"),
+      task: z.string().min(1).describe("The task prompt for the subagent"),
       cwd: z
         .string()
         .optional()
-        .describe("Working directory for the session (default: bridge cwd)"),
+        .describe("Absolute working directory for the session (default: bridge cwd)"),
       mode: z
         .string()
         .optional()
-        .describe("Permission mode to set, e.g. 'bypass', if the agent advertises it"),
+        .describe("Permission mode to set (e.g. 'bypass'); default: config file 'mode' or 'smart'"),
+      model: z
+        .string()
+        .optional()
+        .describe("Model to confirm (e.g. 'swe-2-max'); default: config file 'model' or 'swe-2-max'"),
     },
   },
-  ({ name, task, cwd, mode }) => run(() => ctl.spawn(name, task, cwd, mode)),
+  ({ name, task, cwd, mode, model }) =>
+    run(() => ctl.spawn(name, task, cwd, mode, model)),
 );
 
 server.registerTool(
-  "devin_send",
+  "send",
   {
     title: "Send a message to a subagent",
     description:
-      "Send a follow-up prompt to a subagent. If a turn is already running the " +
-      "message is submitted as a queued mid-turn prompt (picked up after the " +
-      "current tool call); otherwise it starts a new turn.",
+      "Send a follow-up prompt to a subagent. While a turn is running the " +
+      "message is queued in FIFO order and starts as the next turn once the " +
+      "current one finishes (turns are strictly serialized per session). " +
+      "Stopped/dead subagents must be resumed first.",
     inputSchema: {
-      name: z.string().describe("Subagent handle from devin_spawn"),
-      text: z.string().describe("Message text"),
+      name: nameParam,
+      text: z.string().min(1).describe("Message text"),
     },
   },
   ({ name, text }) => run(() => ctl.send(name, text)),
 );
 
 server.registerTool(
-  "devin_poll",
+  "poll",
   {
-    title: "Read new output from a subagent",
+    title: "Inspect a subagent or read its event log",
     description:
-      "Incremental read of a subagent's session updates (agent text, tool calls, " +
-      "turn results) since the last poll. Use wait_ms to block briefly for new events.",
+      "Two observation modes. detail='inspect' (default): a persistent " +
+      "snapshot of what the subagent is doing — lifecycle fields, pending " +
+      "permission, current/latest turn timing and duration, last actual " +
+      "output, active tool calls (merged by id, with elapsed ms), current " +
+      "plan step, latest text, latest error, and last-activity/last-content " +
+      "ages. It is independent of the event log: unaffected by reads or by " +
+      "buffer eviction. detail='logs': the chronological normalized event " +
+      "log (message/thinking/tool/plan/usage/mode/queued/turn_start/" +
+      "turn_end/permission_*) with seq and bridge receipt timestamps, paged " +
+      "by an implicit read cursor; 'limit' bounds each page and " +
+      "nextCursor/hasMore continue it, droppedEvents counts buffer-evicted " +
+      "events. 'since': in inspect mode, a snapshot cursor — wait_ms blocks " +
+      "for events newer than it; in logs mode it replays events after that " +
+      "seq without moving the read cursor. wait_ms blocks briefly while a " +
+      "turn can still produce events.",
     inputSchema: {
-      name: z.string().describe("Subagent handle"),
+      name: nameParam,
       wait_ms: z
         .number()
         .int()
         .min(0)
         .max(60000)
         .optional()
-        .describe("Block up to this many ms for new events (default 0)"),
+        .describe("Block up to this many ms for new events while a turn is active (default 0)"),
       since: z
         .number()
         .int()
+        .min(0)
         .optional()
-        .describe("Return events after this seq instead of the stored read cursor"),
+        .describe(
+          "inspect: wait_ms blocks for events newer than this snapshot cursor. " +
+            "logs: replay events after this seq without moving the read cursor",
+        ),
+      detail: z
+        .enum(["inspect", "logs"])
+        .optional()
+        .describe("inspect (default): persistent snapshot; logs: paged event log"),
+      limit: z
+        .number()
+        .int()
+        .min(1)
+        .max(10000)
+        .optional()
+        .describe("logs only: max buffered events consumed this call; page via nextCursor/hasMore"),
     },
   },
-  ({ name, wait_ms, since }) => run(() => ctl.poll(name, wait_ms ?? 0, since)),
+  ({ name, wait_ms, since, detail, limit }) =>
+    run(() =>
+      ctl.poll(name, wait_ms ?? 0, since, detail ?? "inspect", limit),
+    ),
 );
 
 server.registerTool(
-  "devin_interrupt",
+  "interrupt",
   {
     title: "Interrupt a subagent",
     description:
-      "Cancel the in-flight turn (ACP session/cancel). The session stays alive and resumable.",
-    inputSchema: { name: z.string().describe("Subagent handle") },
+      "Cancel the in-flight turn (ACP session/cancel) and drop queued messages. " +
+      "The session stays alive and resumable.",
+    inputSchema: { name: nameParam },
   },
   ({ name }) => run(() => ctl.interrupt(name)),
 );
 
 server.registerTool(
-  "devin_stop",
+  "stop",
   {
     title: "Stop a subagent",
     description:
-      "Interrupt any running turn and mark the subagent stopped. The session is " +
-      "kept and can be continued later with devin_resume.",
-    inputSchema: { name: z.string().describe("Subagent handle") },
+      "Interrupt any running turn, drop queued messages and mark the subagent " +
+      "stopped. The session is kept and can be continued later with resume.",
+    inputSchema: { name: nameParam },
   },
   ({ name }) => run(() => ctl.stop(name)),
 );
 
 server.registerTool(
-  "devin_resume",
+  "resume",
   {
     title: "Resume a subagent",
     description:
-      "Reload a persisted Devin session (survives bridge restarts and Codex sessions).",
-    inputSchema: { name: z.string().describe("Subagent handle or persisted name") },
+      "Re-activate a stopped/dead/persisted Devin session (survives bridge " +
+      "restarts). Safe no-op on already-running subagents.",
+    inputSchema: { name: nameParam },
   },
   ({ name }) => run(() => ctl.resume(name)),
 );
 
 server.registerTool(
-  "devin_list",
+  "list",
   {
     title: "List subagents",
-    description:
-      "List live, persisted, and agent-side sessions with status.",
+    description: "List live, persisted, and agent-side sessions with status.",
     inputSchema: {},
   },
   () => run(() => ctl.list()),
 );
 
 server.registerTool(
-  "devin_permission",
+  "permission",
   {
     title: "Answer a permission request",
     description:
-      "Grant or deny a pending tool-permission request shown in devin_poll " +
-      "(only used when the bridge runs with DEVIN_SUBAGENT_PERMISSION=operator). " +
+      "Grant or deny a pending tool-permission request surfaced by poll " +
+      "(used when permission=operator — the calling agent decides). " +
       "Pass optionId to approve, omit to deny.",
     inputSchema: {
-      name: z.string().describe("Subagent handle"),
+      name: nameParam,
       optionId: z
         .string()
         .optional()
@@ -175,19 +229,56 @@ server.registerTool(
 );
 
 server.registerTool(
-  "devin_set_mode",
+  "set_mode",
   {
     title: "Change a subagent's permission mode",
-    description: "Switch the session's mode (e.g. 'bypass', 'smart').",
+    description:
+      "Switch the session's mode (e.g. 'bypass', 'smart'). Validated against " +
+      "the session's advertised availableModes when known.",
     inputSchema: {
-      name: z.string().describe("Subagent handle"),
-      mode: z.string().describe("Mode id from the session's availableModes"),
+      name: nameParam,
+      mode: z.string().min(1).describe("Mode id from the session's availableModes"),
     },
   },
   ({ name, mode }) => run(() => ctl.setMode(name, mode)),
 );
 
+server.registerTool(
+  "models",
+  {
+    title: "Report advertised models/modes",
+    description:
+      "With 'name': the session's current model/mode and the agent-advertised " +
+      "available lists. Without: the bridge's configured defaults plus the " +
+      "last-advertised agent-level lists (null until the first session is " +
+      "created). Devin model ids are e.g. swe-2-medium / swe-2-high / swe-2-max.",
+    inputSchema: {
+      name: nameParam.optional(),
+    },
+  },
+  ({ name }) => run(() => ctl.models(name)),
+);
+
+server.registerTool(
+  "set_model",
+  {
+    title: "Change a subagent's model",
+    description:
+      "Switch an idle session's model via session/set_config_option and " +
+      "confirm the echoed value (e.g. 'swe-2-high'). Rejected while the " +
+      "session is starting/running/stopped/dead — resume or wait for idle " +
+      "first. Validated against the advertised model list when known.",
+    inputSchema: {
+      name: nameParam,
+      model: z.string().min(1).describe("Model id from the session's advertised list"),
+    },
+  },
+  ({ name, model }) => run(() => ctl.setModel(name, model)),
+);
+
 async function main(): Promise<void> {
+  cfg = loadConfig();
+  ctl = new Controller(cfg);
   const shutdown = () => {
     ctl.acp.kill();
     process.exit(0);
@@ -199,8 +290,9 @@ async function main(): Promise<void> {
 
   await server.connect(new StdioServerTransport());
   process.stderr.write(
-    `devin-subagents ready (agent: ${cfg.bin} ${cfg.args.join(" ")}, ` +
-      `permission=${cfg.permissionPolicy}, state=${cfg.statePath})\n`,
+    `devin-subagents ready (agent: ${cfg.command} ${cfg.args.join(" ")}, ` +
+      `permission=${cfg.permission}, mode=${cfg.mode ?? "default"}, ` +
+      `model=${cfg.model ?? "agent-default"}, state=${cfg.statePath})\n`,
   );
 }
 

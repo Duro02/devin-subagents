@@ -1,0 +1,10 @@
+{
+  "command": "devin",
+  "args": ["acp"],
+  "statePath": ".devin-subagents.json",
+  "permission": "operator",
+  "mode": "smart",
+  "model": "swe-2-max",
+  "rpcTimeoutMs": 30000,
+  "bufferCap": 500
+}
