@@ -1625,3 +1625,100 @@ test("config: notify/report keys parse with defaults and validation", async (t) 
   assert.throws(() => loadBridgeConfig(w('{"notifyThread": " "}'), dir), /non-empty/);
   assert.throws(() => loadBridgeConfig(w('{"codexCommand": 5}'), dir), /non-empty/);
 });
+
+// ---------- wait: block-until-attention ----------
+
+test("wait: returns done when the turn drains to idle", async (t) => {
+  const { ctl } = makeCtl(t);
+  await ctl.spawn("w1", "[[sleep:150]]");
+  const r = await ctl.wait("w1", 5000);
+  assert.equal(r.wake, "done");
+  assert.equal(r.status, "idle");
+  assert.equal(r.lastStopReason, "end_turn");
+  assert.ok(r.snapshot);
+});
+
+test("wait: report() checkpoint wakes the wait and lands in the log", async (t) => {
+  const { ctl, dir } = makeCtl(t);
+  await ctl.spawn("w2", "[[sleep:2000]]"); // keeps the turn busy
+  const pending = ctl.wait("w2", 3000);
+  await sleep(100);
+  appendFileSync(
+    `${dir}/state.json.mailbox.jsonl`,
+    JSON.stringify({ name: "w2", at: Date.now(), text: "checkpoint A" }) + "\n",
+  );
+  const r = await pending;
+  assert.equal(r.wake, "report");
+  assert.equal(r.report.text, "checkpoint A");
+  // the same report is part of the session's event log (poll logs view)
+  const ev = ctl.registry.get("w2").events.find((e) => e.kind === "report");
+  assert.equal(ev.data.text, "checkpoint A");
+  // and it still reaches the parent-facing inbox/queue path
+  const inbox = ctl.notifyInbox();
+  assert.equal(inbox.length, 1);
+  assert.equal(inbox[0].text, "checkpoint A");
+  await untilDone(ctl, "w2");
+});
+
+test("wait: operator permission request wakes immediately", async (t) => {
+  const { ctl } = makeCtl(t, { policy: "operator" });
+  await ctl.spawn("w3", "[[perm]]");
+  const r = await ctl.wait("w3", 5000);
+  assert.equal(r.wake, "permission");
+  assert.equal(r.permission.toolCall.toolCallId, "tc-perm");
+  ctl.permission("w3", "allow_once");
+  await untilDone(ctl, "w3");
+});
+
+test("wait: timeout returns a live snapshot while still running", async (t) => {
+  const { ctl } = makeCtl(t);
+  await ctl.spawn("w4", "[[sleep:1500]]");
+  const t0 = Date.now();
+  const r = await ctl.wait("w4", 120);
+  assert.equal(r.wake, "timeout");
+  assert.equal(r.status, "running");
+  assert.ok(r.waitedMs >= 100 && Date.now() - t0 < 1500);
+  await untilDone(ctl, "w4");
+});
+
+test("wait: already-idle subagent answers done with no delay", async (t) => {
+  const { ctl } = makeCtl(t);
+  await ctl.spawn("w5", "[[sleep:5]]");
+  await untilDone(ctl, "w5");
+  const t0 = Date.now();
+  const r = await ctl.wait("w5", 5000);
+  assert.equal(r.wake, "done");
+  assert.ok(Date.now() - t0 < 500);
+});
+
+test("autoRegister: _meta thread learned; manual/off always win", async (t) => {
+  const { stub, log } = codexStub(t);
+  const { ctl, dir } = makeCtl(t, { codexCommand: stub });
+
+  ctl.autoNotify("thread-auto");
+  assert.equal(ctl.notify().thread, "thread-auto");
+  assert.equal(ctl.notify().mode, "auto");
+  // delivery flows without any notify() call
+  appendFileSync(
+    `${dir}/state.json.mailbox.jsonl`,
+    JSON.stringify({ name: "k", at: 1, text: "auto wired" }) + "\n",
+  );
+  ctl.notifyInbox(); // forces a drain; entry goes to the queue, not inbox
+  const out = await untilFile(log);
+  assert.match(out, /--thread/);
+  assert.match(out, /thread-auto/);
+  assert.match(out, /\[devin-subagents\] k: auto wired/);
+
+  // a manual registration overrides the learned one
+  ctl.notify("thread-manual");
+  ctl.autoNotify("thread-other");
+  assert.equal(ctl.notify().thread, "thread-manual");
+  assert.equal(ctl.notify().mode, "manual");
+
+  // explicit off sticks — auto-capture can't resurrect delivery
+  ctl.notify(undefined, true);
+  ctl.autoNotify("thread-x");
+  const st = ctl.notify();
+  assert.equal(st.thread, null);
+  assert.equal(st.mode, "off");
+});

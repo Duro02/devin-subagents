@@ -1,7 +1,13 @@
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
+import { InMemoryTaskStore } from "@modelcontextprotocol/sdk/experimental/tasks/stores/in-memory.js";
+import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
-import { Controller, type ControllerConfig } from "./controller.js";
+import {
+  Controller,
+  WAIT_DEFAULT_MS,
+  type ControllerConfig,
+} from "./controller.js";
 import { loadBridgeConfig, USAGE } from "./config.js";
 
 function loadConfig(): ControllerConfig {
@@ -40,8 +46,26 @@ const fail = (e: unknown) => ({
     { type: "text" as const, text: e instanceof Error ? e.message : String(e) },
   ],
 });
-const run = async (f: () => Promise<unknown> | unknown) => {
+/**
+ * Harnesses that tag tool calls with their session identity (Codex sends
+ * `_meta["x-codex-turn-metadata"].thread_id`) get queue delivery for free:
+ * the first tagged call auto-registers the thread — no notify() needed.
+ */
+const captureThread = (meta?: Record<string, unknown>): void => {
+  const tm = meta?.["x-codex-turn-metadata"];
+  const tid =
+    tm !== null && typeof tm === "object"
+      ? (tm as Record<string, unknown>).thread_id
+      : undefined;
+  if (typeof tid === "string" && tid.trim()) ctl.autoNotify(tid);
+};
+
+const run = async (
+  f: () => Promise<unknown> | unknown,
+  extra?: { _meta?: Record<string, unknown> },
+) => {
   try {
+    captureThread(extra?._meta);
     let v = await f();
     // Undelivered subagent notices ride along on every tool result so a
     // report() never sits unread just because no queue thread is set.
@@ -62,10 +86,19 @@ const nameParam = z
   .string()
   .describe("Subagent handle returned by spawn, e.g. 'coder-auth'");
 
-const server = new McpServer({
-  name: "devin-subagents",
-  version: "0.5.0",
-});
+const server = new McpServer(
+  {
+    name: "devin-subagents",
+    version: "0.5.0",
+  },
+  {
+    // Advertise MCP tasks: on clients that speak the protocol, task-aware
+    // tools (wait) can run as real background tasks whose result is
+    // delivered natively. Older clients just see normal tools.
+    capabilities: { tasks: { requests: { tools: { call: {} } } } },
+    taskStore: new InMemoryTaskStore(),
+  },
+);
 
 server.registerTool(
   "spawn",
@@ -95,8 +128,8 @@ server.registerTool(
         .describe("Model to confirm (e.g. 'swe-2-max'); default: config file 'model' or 'swe-2-max'"),
     },
   },
-  ({ name, task, cwd, mode, model }) =>
-    run(() => ctl.spawn(name, task, cwd, mode, model)),
+  ({ name, task, cwd, mode, model }, extra) =>
+    run(() => ctl.spawn(name, task, cwd, mode, model), extra),
 );
 
 server.registerTool(
@@ -113,7 +146,7 @@ server.registerTool(
       text: z.string().min(1).describe("Message text"),
     },
   },
-  ({ name, text }) => run(() => ctl.send(name, text)),
+  ({ name, text }, extra) => run(() => ctl.send(name, text), extra),
 );
 
 server.registerTool(
@@ -167,10 +200,81 @@ server.registerTool(
         .describe("logs only: max buffered events consumed this call; page via nextCursor/hasMore"),
     },
   },
-  ({ name, wait_ms, since, detail, limit }) =>
-    run(() =>
-      ctl.poll(name, wait_ms ?? 0, since, detail ?? "inspect", limit),
+  ({ name, wait_ms, since, detail, limit }, extra) =>
+    run(
+      () => ctl.poll(name, wait_ms ?? 0, since, detail ?? "inspect", limit),
+      extra,
     ),
+);
+
+// `wait` is a task-augmented tool: on hosts that speak MCP tasks the call
+// becomes a background task and its result arrives natively on completion;
+// everywhere else the SDK turns a normal call into createTask + internal
+// polling, so the same code blocks synchronously for older clients.
+server.experimental.tasks.registerToolTask(
+  "wait",
+  {
+    title: "Wait until a subagent needs attention",
+    description:
+      "Block until the subagent needs you, then return what happened. " +
+      "Wakes on: turn drained to idle (wake='done'), a pending permission " +
+      "request (wake='permission' — answer via the permission tool), a " +
+      "report() checkpoint from the subagent (wake='report'), terminal " +
+      "states (wake='stopped'/'dead'), or timeout (wake='timeout', " +
+      "snapshot shows live state). Already-attention states return " +
+      "immediately, so it doubles as 'is it done?'. On hosts supporting " +
+      "MCP tasks this runs as a background task; elsewhere it blocks.",
+    inputSchema: {
+      name: nameParam,
+      timeout_ms: z
+        .number()
+        .int()
+        .min(0)
+        .max(3600000)
+        .optional()
+        .describe(
+          `Block up to this many ms for attention (default ${WAIT_DEFAULT_MS}, max 3600000)`,
+        ),
+    },
+    execution: { taskSupport: "optional" },
+  },
+  {
+    createTask: async ({ name, timeout_ms }, extra) => {
+      captureThread(extra._meta as Record<string, unknown> | undefined);
+      const task = await extra.taskStore!.createTask({
+        ttl: extra.taskRequestedTtl ?? null,
+        pollInterval: 500,
+      });
+      void (async () => {
+        try {
+          let v: unknown = await ctl.wait(name, timeout_ms ?? WAIT_DEFAULT_MS);
+          const inbox = ctl.notifyInbox();
+          if (inbox.length) {
+            v = { ...(v as Record<string, unknown>), inbox };
+          }
+          await extra.taskStore!.storeTaskResult(
+            task.taskId,
+            "completed",
+            ok(v),
+          );
+        } catch (e) {
+          await extra.taskStore!.storeTaskResult(
+            task.taskId,
+            "failed",
+            fail(e),
+          );
+        }
+      })();
+      return { task };
+    },
+    getTask: async (_args, { taskId, taskStore }) => {
+      const t = await taskStore!.getTask(taskId!);
+      if (!t) throw new Error(`unknown task ${taskId}`);
+      return t;
+    },
+    getTaskResult: async (_args, { taskId, taskStore }) =>
+      (await taskStore!.getTaskResult(taskId!)) as CallToolResult,
+  },
 );
 
 server.registerTool(
@@ -182,7 +286,7 @@ server.registerTool(
       "The session stays alive and resumable.",
     inputSchema: { name: nameParam },
   },
-  ({ name }) => run(() => ctl.interrupt(name)),
+  ({ name }, extra) => run(() => ctl.interrupt(name), extra),
 );
 
 server.registerTool(
@@ -194,7 +298,7 @@ server.registerTool(
       "stopped. The session is kept and can be continued later with resume.",
     inputSchema: { name: nameParam },
   },
-  ({ name }) => run(() => ctl.stop(name)),
+  ({ name }, extra) => run(() => ctl.stop(name), extra),
 );
 
 server.registerTool(
@@ -206,7 +310,7 @@ server.registerTool(
       "restarts). Safe no-op on already-running subagents.",
     inputSchema: { name: nameParam },
   },
-  ({ name }) => run(() => ctl.resume(name)),
+  ({ name }, extra) => run(() => ctl.resume(name), extra),
 );
 
 server.registerTool(
@@ -214,14 +318,15 @@ server.registerTool(
   {
     title: "Register a Codex thread for subagent notices",
     description:
-      "Point subagent notices at a Codex session. Once a thread is " +
-      "registered, turn completions, permission requests and subagent " +
+      "Point subagent notices at a Codex session. Usually automatic: " +
+      "hosts that tag tool calls with their thread id (Codex's " +
+      "x-codex-turn-metadata) are registered on first use. Once a thread " +
+      "is known, turn completions, permission requests and subagent " +
       "report() calls are pushed into that session via `codex queue` " +
       "(they arrive as queued messages — no polling needed). Without a " +
       "thread, notices ride along on tool results as `inbox` instead. " +
-      "The thread is a session UUID or exact session name — find it via " +
-      "`codex agents` or ask the user. Call with no args for status, " +
-      "off:true to unregister.",
+      "Pass a thread (session UUID or exact session name) to override the " +
+      "auto-detected one, no args for status, off:true to unregister.",
     inputSchema: {
       thread: z
         .string()
@@ -234,7 +339,7 @@ server.registerTool(
         .describe("true: unregister and stop queue delivery"),
     },
   },
-  ({ thread, off }) => run(() => ctl.notify(thread, off)),
+  ({ thread, off }, extra) => run(() => ctl.notify(thread, off), extra),
 );
 
 server.registerTool(
@@ -244,7 +349,7 @@ server.registerTool(
     description: "List live, persisted, and agent-side sessions with status.",
     inputSchema: {},
   },
-  () => run(() => ctl.list()),
+  (_args, extra) => run(() => ctl.list(), extra),
 );
 
 server.registerTool(
@@ -263,7 +368,8 @@ server.registerTool(
         .describe("The optionId from pendingPermission.options to select"),
     },
   },
-  ({ name, optionId }) => run(() => ctl.permission(name, optionId)),
+  ({ name, optionId }, extra) =>
+    run(() => ctl.permission(name, optionId), extra),
 );
 
 server.registerTool(
@@ -278,7 +384,7 @@ server.registerTool(
       mode: z.string().min(1).describe("Mode id from the session's availableModes"),
     },
   },
-  ({ name, mode }) => run(() => ctl.setMode(name, mode)),
+  ({ name, mode }, extra) => run(() => ctl.setMode(name, mode), extra),
 );
 
 server.registerTool(
@@ -294,7 +400,7 @@ server.registerTool(
       name: nameParam.optional(),
     },
   },
-  ({ name }) => run(() => ctl.models(name)),
+  ({ name }, extra) => run(() => ctl.models(name), extra),
 );
 
 server.registerTool(
@@ -311,7 +417,7 @@ server.registerTool(
       model: z.string().min(1).describe("Model id from the session's advertised list"),
     },
   },
-  ({ name, model }) => run(() => ctl.setModel(name, model)),
+  ({ name, model }, extra) => run(() => ctl.setModel(name, model), extra),
 );
 
 async function main(): Promise<void> {
