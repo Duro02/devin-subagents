@@ -44,6 +44,29 @@ export interface BridgeConfig {
   hideFromSessionList: boolean;
   /** devin session DB override (default: platform data dir path) */
   sessionDbPath?: string;
+  /**
+   * Codex thread (session UUID or exact name) receiving subagent notices
+   * via `codex queue`. When unset, notices wait in the inbox and ride
+   * along on tool results instead of pushing.
+   */
+  notifyThread?: string;
+  /** codex binary used for `codex queue` delivery (default: "codex") */
+  codexCommand: string;
+  /**
+   * inject a per-session MCP server exposing `report(message)` into every
+   * subagent via session/new|load mcpServers (default: true)
+   */
+  reportTool: boolean;
+  /**
+   * bridge-side notices for turn completion and permission requests
+   * (default: true)
+   */
+  autoNotify: boolean;
+  /**
+   * append a short "you have a report tool" hint to the spawn task so the
+   * subagent knows it exists (default: true; requires reportTool)
+   */
+  reportHint: boolean;
 }
 
 const ALLOWED_KEYS = new Set([
@@ -57,6 +80,11 @@ const ALLOWED_KEYS = new Set([
   "bufferCap",
   "hideFromSessionList",
   "sessionDbPath",
+  "notifyThread",
+  "codexCommand",
+  "reportTool",
+  "autoNotify",
+  "reportHint",
 ]);
 
 const DEFAULTS: Omit<BridgeConfig, "statePath" | "sessionDbPath"> = {
@@ -68,6 +96,10 @@ const DEFAULTS: Omit<BridgeConfig, "statePath" | "sessionDbPath"> = {
   rpcTimeoutMs: 30_000,
   bufferCap: 500,
   hideFromSessionList: true,
+  codexCommand: "codex",
+  reportTool: true,
+  autoNotify: true,
+  reportHint: true,
 };
 
 export interface LoadedConfig {
@@ -90,7 +122,8 @@ Usage: node dist/index.js [--config PATH] [--help]
 
 Config keys (all optional): command, args, statePath, permission
 ("auto"|"always"|"operator"), mode, model, rpcTimeoutMs, bufferCap,
-hideFromSessionList, sessionDbPath.
+hideFromSessionList, sessionDbPath, notifyThread, codexCommand,
+reportTool, autoNotify, reportHint.
 Environment variables are NOT read as bridge settings.
 `;
 
@@ -236,6 +269,31 @@ export function loadBridgeConfig(
     }
     cfg.sessionDbPath = rel(o.sessionDbPath);
     specified.add("sessionDbPath");
+  }
+  if (o.notifyThread !== undefined) {
+    if (typeof o.notifyThread !== "string" || !o.notifyThread.trim()) {
+      fail(file, `notifyThread must be a non-empty string`);
+    }
+    cfg.notifyThread = o.notifyThread;
+    specified.add("notifyThread");
+  }
+  if (o.codexCommand !== undefined) {
+    if (typeof o.codexCommand !== "string" || !o.codexCommand.trim()) {
+      fail(file, `codexCommand must be a non-empty string`);
+    }
+    cfg.codexCommand = /[/\\]/.test(o.codexCommand)
+      ? rel(o.codexCommand)
+      : o.codexCommand;
+    specified.add("codexCommand");
+  }
+  for (const k of ["reportTool", "autoNotify", "reportHint"] as const) {
+    if (o[k] !== undefined) {
+      if (typeof o[k] !== "boolean") {
+        fail(file, `${k} must be a boolean`);
+      }
+      cfg[k] = o[k] as boolean;
+      specified.add(k);
+    }
   }
   return { config: cfg, file, specified, help: false };
 }

@@ -170,14 +170,18 @@ export class AcpClient {
 
   // ---- ACP agent methods ----
 
-  newSession(cwd: string): Promise<Json> {
-    return this.call("session/new", { cwd, mcpServers: [] }, this.timeoutMs());
+  newSession(cwd: string, mcpServers: Json[] = []): Promise<Json> {
+    return this.call("session/new", { cwd, mcpServers }, this.timeoutMs());
   }
 
-  loadSession(sessionId: string, cwd: string): Promise<Json> {
+  loadSession(
+    sessionId: string,
+    cwd: string,
+    mcpServers: Json[] = [],
+  ): Promise<Json> {
     return this.call(
       "session/load",
-      { sessionId, cwd, mcpServers: [] },
+      { sessionId, cwd, mcpServers },
       this.timeoutMs(),
     );
   }

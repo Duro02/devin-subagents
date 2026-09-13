@@ -8,7 +8,7 @@ Codex CLI ──stdio/MCP──▶ devin-subagents(本仓库)──stdio/ACP─�
 
 **生命周期模型**:桥进程由 Codex 在会话启动时拉起(stdio MCP 的标准语义),Codex 退出时桥带着 `devin acp` 子进程一起退出。会话本体持久化在 Devin 自己的 session DB 里,桥只把 `session_id` 记到 `.devin-subagents.json`,所以**桥重启后 `resume` 照样恢复旧会话**。`devin acp` 进程崩溃/启动失败后,下一次需要它的调用会自动重启进程;已注册会话标记 `dead`,逐个 `resume`(走 `session/load`)即可复活。
 
-## 工具面(11 个)
+## 工具面(12 个)
 
 | 工具 | 对应 ACP | 说明 |
 | --- | --- | --- |
@@ -19,6 +19,7 @@ Codex CLI ──stdio/MCP──▶ devin-subagents(本仓库)──stdio/ACP─�
 | `stop(name)` | cancel + 标记 | 同上,另标记 `stopped`(可 `resume`)并落盘 |
 | `resume(name)` | `session/load` | 恢复 stopped/dead/持久化会话;对 running/idle 是安全 no-op。**保留会话自己的选择**——落盘的 mode/model 在 reload 后重新断言,不会被桥的默认值覆盖 |
 | `list()` | `session/list` + 本地注册表 | 看所有子代理状态(`agentAlive`、`agentSessions`、`agentSessionsError?`) |
+| `notify(thread?, off?)` | `codex queue`(外部通道) | 注册接收子代理通知的 Codex 会话;注册后 turn 结束、权限请求、子代理 `report()` 调用都会以排队消息形式推进该会话(见"子代理主动汇报"节);无参查询状态,`off:true` 注销 |
 | `permission(name, optionId?)` | `session/request_permission` 应答 | `permission=operator` 时由主代理裁决权限;`optionId` 必须是 `pendingPermission.options` 之一 |
 | `set_mode(name, mode)` | `session/set_mode`(不支持时回落 `session/set_config_option {configId:"mode"}`) | 切会话权限模式;若已知 `availableModes` 会先校验 |
 | `models(name?)` | 本地能力缓存 | 带 `name`:该会话的当前 model/mode 与广告列表;不带:桥的默认配置 + 迄今为止任何会话广告过的列表(首次会话建立前为 `null`) |
@@ -178,6 +179,11 @@ devin-subagents [--config PATH] [--help]
 | `bufferCap` | `500` | 每个会话的事件环形缓冲上限 |
 | `hideFromSessionList` | `true` | 把桥管理的会话在 devin session DB 里标记 `hidden=1`,使其不出现在 `/resume`、`devin list`、agent `session/list` 中(见下) |
 | `sessionDbPath` | 平台数据目录(`~/.local/share/devin/cli/sessions.db`,macOS 为 `~/Library/Application Support/devin/cli/sessions.db`,尊重 `XDG_DATA_HOME`/`APPDATA`) | devin session DB 路径覆盖;相对路径相对配置文件目录 |
+| `notifyThread` | 无 | 接收子代理通知的 Codex 会话(UUID 或确切会话名);等价于 `notify` 工具注册的静态配置版,适合固定单会话场景 |
+| `codexCommand` | `"codex"` | `codex queue` 投递用的 codex 命令;含路径分隔符的相对路径相对配置文件目录解析 |
+| `reportTool` | `true` | 给每个子代理会话注入 `report` MCP 工具(经 `session/new`/`load` 的 `mcpServers` 字段) |
+| `autoNotify` | `true` | 桥侧自动通知:turn 排空转 idle(含尾部输出摘要)与 operator 模式权限请求 |
+| `reportHint` | `true` | spawn 的 task 尾部自动附一句"你有 `report` 工具"的提示,让子代理知道它的存在(需 `reportTool`) |
 
 - **schema 严格**:未知键、错误类型、非法 JSON 都直接拒绝;显式 `--config` 的文件不存在也报错。
 - **优先级**:`spawn` 的 `mode`/`model` 参数 > 配置文件值 > 内置默认。**文件里写明的值是"刻意配置"**:agent 未广告或确认值不符时 spawn 直接报错。model 无论来源都要求精确确认(内置默认也不例外);内置默认 mode 不被支持则记 `mode_skipped` 继续跑。
@@ -190,6 +196,17 @@ devin-subagents [--config PATH] [--help]
 - 副作用:交互式 `devin -r <id>` / `/resume <id>` 的 id 前缀解析同样过滤 `hidden=0`,即隐藏会话无法从 CLI 手动恢复——这是"隐藏"语义的组成部分。要手动捞回:`sqlite3 ~/.local/share/devin/cli/sessions.db "UPDATE sessions SET hidden=0 WHERE id='<sessionId>'"`。
 - 会话行是**惰性持久化**的(首个 prompt 落盘才插行),所以桥在 spawn 后把 sessionId 记入待置位集合,在每次 `poll`/`list`/`resume` 时幂等重试,直到行出现为止;`list()` 的 `subagents[].hidden` 字段反映是否已确认置位。
 - 实现是"尽力而为"的旁路写入:DB 缺失、老版本 schema 没有 `hidden` 列(Devin V15 migration 才引入)、`node:sqlite` 不可用(Node < 22.5)时功能自动禁用,只记一条 stderr 日志,绝不阻塞工具调用。WAL 模式下一条短 `UPDATE` 与 devin 自身写入并发安全,且 devin 从不在 insert 后改写该列,置位不会被覆盖。
+
+### 子代理主动汇报(`report` + `notify`)
+
+子代理的 ACP 事件本来就实时推到桥(不依赖 `poll`),断点只在"桥 → Codex 主会话"没有注入通道。本节补的就是这一跳:
+
+- **子代理侧**:`session/new`/`session/load` 的 `mcpServers` 注入一个 per-session MCP server(`dist/child.js`),暴露一个 `report(message)` 工具——子代理调它即把 `{name, at, text}` 追加进 `<statePath>.mailbox.jsonl`,桥经 `fs.watch` 实时收走。devin 实测会拉起并完成该 MCP 握手;spawn 的 task 末尾自动附了提示(`reportHint`),子代理知道它存在。要用"分析完先汇报再动手"这类分阶段汇报,直接在 task 里要求它调 `report` 即可。
+- **桥侧自动通知**(`autoNotify`):turn 排空转 `idle` 时发"turn N ended (stopReason) — 尾部输出摘要";`permission=operator` 收到权限请求时发"requests permission: \<tool\>"。`cancelled` 结算(即你自己的 `interrupt`/`stop`)不通知。
+- **投递**:注册 thread 后( `notify` 工具或 `notifyThread` 配置),每条通知以 `codex queue --thread <t> --message "[devin-subagents] <name>: <text>"` 注入——消息作为排队用户消息进入该会话,在下一个 turn 边界被主代理看到。投递失败(codex 不存在、thread 已死)自动降级进 inbox。
+- **未注册/投递失败时**:通知堆进 inbox,**任何工具调用的返回都会捎带 `inbox` 字段**——主代理不 poll 也有机会在下一次工具结果里看到,不会静默丢失(inbox 上限 100 条)。
+- **接线要求**:`codex queue` 目标必须是在 app-server daemon 上存活的会话(UUID 或确切会话名;`codex agents` 可查)。注册写入 `<statePath>.notify.json`,桥重启后沿用;换会话用 `notify(thread)` 重注册或 `off` 注销。
+- **注意**:queue 是"排队"语义——主会话正在跑的 turn 不会被半路打断,消息在该 turn 结束时送达;要"立刻催"请配合让主代理周期性做工具调用(任何一次结果都可能捎带 inbox)。
 
 ## 权限与隔离边界(重要)
 

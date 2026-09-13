@@ -46,7 +46,7 @@
 //   [[big]]        emit a large tool output (truncation check)
 //   [[mode]]       emit a current_mode_update mid-turn
 import { createInterface } from "node:readline";
-import { existsSync, rmSync } from "node:fs";
+import { existsSync, rmSync, appendFileSync } from "node:fs";
 
 const HANG = new Set((process.env.FAKE_ACP_HANG ?? "").split(",").filter(Boolean));
 const NEW_DELAY = Number(process.env.FAKE_ACP_NEW_DELAY ?? 0);
@@ -58,6 +58,16 @@ const NO_SETMODE = process.env.FAKE_ACP_NO_SETMODE === "1";
 const FORCE_MODEL = process.env.FAKE_ACP_FORCE_MODEL;
 const CFG_DELAY = Number(process.env.FAKE_ACP_CFG_DELAY ?? 0);
 const CFG_NO_ECHO = process.env.FAKE_ACP_CFG_NO_ECHO === "1";
+// Append {method, params} JSONL for selected RPCs so tests can inspect
+// what the bridge sent (e.g. session/new mcpServers).
+const PARAM_LOG = process.env.FAKE_ACP_PARAM_LOG;
+const logParams = (method, params) => {
+  if (PARAM_LOG) {
+    try {
+      appendFileSync(PARAM_LOG, JSON.stringify({ method, params }) + "\n");
+    } catch { /* test artifact — best effort */ }
+  }
+};
 
 /** One-shot init delay: only while the marker file exists. */
 function initDelay() {
@@ -432,6 +442,7 @@ rl.on("line", (line) => {
       return;
     }
     case "session/new": {
+      logParams("session/new", msg.params);
       setTimeout(() => {
         const id = `sess-${++nextSess}`;
         sessions.set(id, {
@@ -445,6 +456,7 @@ rl.on("line", (line) => {
       return;
     }
     case "session/load": {
+      logParams("session/load", msg.params);
       const sessionId = String(msg.params?.sessionId ?? "");
       if (!sessions.has(sessionId)) {
         // devin's session DB survives restarts: a well-formed id always loads.

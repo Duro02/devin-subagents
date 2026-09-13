@@ -42,7 +42,17 @@ const fail = (e: unknown) => ({
 });
 const run = async (f: () => Promise<unknown> | unknown) => {
   try {
-    return ok(await f());
+    let v = await f();
+    // Undelivered subagent notices ride along on every tool result so a
+    // report() never sits unread just because no queue thread is set.
+    const inbox = ctl.notifyInbox();
+    if (inbox.length) {
+      v =
+        v !== null && typeof v === "object" && !Array.isArray(v)
+          ? { ...(v as Record<string, unknown>), inbox }
+          : { result: v ?? null, inbox };
+    }
+    return ok(v);
   } catch (e) {
     return fail(e);
   }
@@ -200,6 +210,34 @@ server.registerTool(
 );
 
 server.registerTool(
+  "notify",
+  {
+    title: "Register a Codex thread for subagent notices",
+    description:
+      "Point subagent notices at a Codex session. Once a thread is " +
+      "registered, turn completions, permission requests and subagent " +
+      "report() calls are pushed into that session via `codex queue` " +
+      "(they arrive as queued messages — no polling needed). Without a " +
+      "thread, notices ride along on tool results as `inbox` instead. " +
+      "The thread is a session UUID or exact session name — find it via " +
+      "`codex agents` or ask the user. Call with no args for status, " +
+      "off:true to unregister.",
+    inputSchema: {
+      thread: z
+        .string()
+        .min(1)
+        .optional()
+        .describe("Codex session UUID or exact session name to notify"),
+      off: z
+        .boolean()
+        .optional()
+        .describe("true: unregister and stop queue delivery"),
+    },
+  },
+  ({ thread, off }) => run(() => ctl.notify(thread, off)),
+);
+
+server.registerTool(
   "list",
   {
     title: "List subagents",
@@ -280,7 +318,7 @@ async function main(): Promise<void> {
   cfg = loadConfig();
   ctl = new Controller(cfg);
   const shutdown = () => {
-    ctl.acp.kill();
+    ctl.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
