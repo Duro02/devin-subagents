@@ -29,6 +29,12 @@ export interface NotifyOptions {
   codexCommand: string;
   /** seed thread from config (static setups) */
   thread?: string;
+  /**
+   * called for every parsed mailbox entry (in addition to delivery) —
+   * the controller feeds these into the session event log so `wait`
+   * and `poll logs` can observe report() calls
+   */
+  onEntry?: (e: MailEntry) => void;
   onLog?: (line: string) => void;
 }
 
@@ -55,8 +61,15 @@ export class NotifyHub {
   readonly mailboxPath: string;
   private notifyPath: string;
   private codexCommand: string;
+  private onEntry?: (e: MailEntry) => void;
   private onLog?: (line: string) => void;
   private thread?: string;
+  /**
+   * none: no thread known · auto: learned from tool-call _meta ·
+   * manual: notify tool / config / persisted file · off: explicit
+   * unregister — auto-capture never overrides manual or off.
+   */
+  private mode: "none" | "auto" | "manual" | "off" = "none";
   private inbox: MailEntry[] = [];
   private delivered = 0;
   private offset = 0;
@@ -70,8 +83,10 @@ export class NotifyHub {
     this.mailboxPath = opts.mailboxPath;
     this.notifyPath = opts.notifyPath;
     this.codexCommand = opts.codexCommand;
+    this.onEntry = opts.onEntry;
     this.onLog = opts.onLog;
     this.thread = opts.thread ?? this.loadThread();
+    if (this.thread) this.mode = "manual";
 
     // The mailbox must exist before it can be watched.
     try {
@@ -157,7 +172,9 @@ export class NotifyHub {
     for (const line of lines) {
       if (!line.trim()) continue;
       try {
-        this.deliver(JSON.parse(line) as MailEntry);
+        const e = JSON.parse(line) as MailEntry;
+        this.onEntry?.(e);
+        this.deliver(e);
       } catch {
         /* malformed line — skip */
       }
@@ -241,6 +258,7 @@ export class NotifyHub {
     const t = thread.trim();
     if (!t) throw new Error("thread must be a non-empty string");
     this.thread = t;
+    this.mode = "manual";
     this.queueRetryAt = 0;
     this.persistThread();
     // A thread just arrived: push anything that piled up in the inbox.
@@ -249,8 +267,25 @@ export class NotifyHub {
     return this.status();
   }
 
+  /**
+   * Learn the parent thread from tool-call metadata — harnesses that tag
+   * calls (e.g. Codex's `_meta.x-codex-turn-metadata.thread_id`) get queue
+   * delivery for free, no notify() call needed. Never overrides a manual
+   * registration or an explicit off; never persisted (the id is
+   * session-scoped, not setup-scoped).
+   */
+  autoRegister(thread: string): void {
+    const t = thread.trim();
+    if (!t || (this.mode !== "none" && this.mode !== "auto")) return;
+    this.thread = t;
+    this.mode = "auto";
+    for (const e of this.inbox.splice(0)) this.deliver(e);
+    this.drainMailbox();
+  }
+
   unregister(): Record<string, unknown> {
     this.thread = undefined;
+    this.mode = "off";
     this.persistThread();
     return this.status();
   }
@@ -258,6 +293,7 @@ export class NotifyHub {
   status(): Record<string, unknown> {
     return {
       thread: this.thread ?? null,
+      mode: this.mode,
       delivered: this.delivered,
       inbox: this.inbox.length,
       mailbox: this.mailboxPath,

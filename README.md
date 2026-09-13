@@ -8,7 +8,7 @@ Codex CLI ──stdio/MCP──▶ devin-subagents(本仓库)──stdio/ACP─�
 
 **生命周期模型**:桥进程由 Codex 在会话启动时拉起(stdio MCP 的标准语义),Codex 退出时桥带着 `devin acp` 子进程一起退出。会话本体持久化在 Devin 自己的 session DB 里,桥只把 `session_id` 记到 `.devin-subagents.json`,所以**桥重启后 `resume` 照样恢复旧会话**。`devin acp` 进程崩溃/启动失败后,下一次需要它的调用会自动重启进程;已注册会话标记 `dead`,逐个 `resume`(走 `session/load`)即可复活。
 
-## 工具面(12 个)
+## 工具面(13 个)
 
 | 工具 | 对应 ACP | 说明 |
 | --- | --- | --- |
@@ -19,7 +19,8 @@ Codex CLI ──stdio/MCP──▶ devin-subagents(本仓库)──stdio/ACP─�
 | `stop(name)` | cancel + 标记 | 同上,另标记 `stopped`(可 `resume`)并落盘 |
 | `resume(name)` | `session/load` | 恢复 stopped/dead/持久化会话;对 running/idle 是安全 no-op。**保留会话自己的选择**——落盘的 mode/model 在 reload 后重新断言,不会被桥的默认值覆盖 |
 | `list()` | `session/list` + 本地注册表 | 看所有子代理状态(`agentAlive`、`agentSessions`、`agentSessionsError?`) |
-| `notify(thread?, off?)` | `codex queue`(外部通道) | 注册接收子代理通知的 Codex 会话;注册后 turn 结束、权限请求、子代理 `report()` 调用都会以排队消息形式推进该会话(见"子代理主动汇报"节);无参查询状态,`off:true` 注销 |
+| `wait(name, timeout_ms?)` | `session/update` 缓冲(唤醒条件在桥侧判定) | **阻塞到"需要注意"才返回**:`wake` 字段给出原因——`done`(turn 排空转 idle)、`permission`(待裁决权限)、`report`(子代理检查点)、`stopped`/`dead`(终态)、`timeout`(附实时快照)。已在 attention 态的会话立即返回,兼具"看完成没"用途。声明了 `taskSupport: "optional"`:支持 MCP tasks 的宿主里它是真后台任务,其余宿主里是普通阻塞调用 |
+| `notify(thread?, off?)` | `codex queue`(外部通道) | 注册接收子代理通知的 Codex 会话。**通常自动**:Codex 每次工具调用都在 `_meta["x-codex-turn-metadata"]` 带 thread_id,桥在首次调用时自动接线(`mode:"auto"`);传 thread 为手动指定/覆盖,`off:true` 注销且不再被自动接线复活。无参查询状态(含 `mode`/`delivered`/`inbox` 计数) |
 | `permission(name, optionId?)` | `session/request_permission` 应答 | `permission=operator` 时由主代理裁决权限;`optionId` 必须是 `pendingPermission.options` 之一 |
 | `set_mode(name, mode)` | `session/set_mode`(不支持时回落 `session/set_config_option {configId:"mode"}`) | 切会话权限模式;若已知 `availableModes` 会先校验 |
 | `models(name?)` | 本地能力缓存 | 带 `name`:该会话的当前 model/mode 与广告列表;不带:桥的默认配置 + 迄今为止任何会话广告过的列表(首次会话建立前为 `null`) |
@@ -203,10 +204,10 @@ devin-subagents [--config PATH] [--help]
 
 - **子代理侧**:`session/new`/`session/load` 的 `mcpServers` 注入一个 per-session MCP server(`dist/child.js`),暴露一个 `report(message)` 工具——子代理调它即把 `{name, at, text}` 追加进 `<statePath>.mailbox.jsonl`,桥经 `fs.watch` 实时收走。devin 实测会拉起并完成该 MCP 握手;spawn 的 task 末尾自动附了提示(`reportHint`),子代理知道它存在。要用"分析完先汇报再动手"这类分阶段汇报,直接在 task 里要求它调 `report` 即可。
 - **桥侧自动通知**(`autoNotify`):turn 排空转 `idle` 时发"turn N ended (stopReason) — 尾部输出摘要";`permission=operator` 收到权限请求时发"requests permission: \<tool\>"。`cancelled` 结算(即你自己的 `interrupt`/`stop`)不通知。
-- **投递**:注册 thread 后( `notify` 工具或 `notifyThread` 配置),每条通知以 `codex queue --thread <t> --message "[devin-subagents] <name>: <text>"` 注入——消息作为排队用户消息进入该会话,在下一个 turn 边界被主代理看到。投递失败(codex 不存在、thread 已死)自动降级进 inbox。
+- **投递**:thread 已知后,每条通知以 `codex queue --thread <t> --message "[devin-subagents] <name>: <text>"` 注入——消息作为排队用户消息进入该会话:主会话空闲时**唤醒一个新 turn**,正忙则在下一个 turn 边界送达。投递失败(codex 不存在、thread 已死)自动降级进 inbox。
+- **thread 从哪来**:三层,优先级手动 > 自动 > 无——① `notify(thread)` / `notifyThread` 配置为手动指定(写入 `<statePath>.notify.json` 持久化);② Codex 的 `tools/call` 在 `_meta["x-codex-turn-metadata"].thread_id` 里带会话 id,桥在**任何一次**工具调用时自动学到(`mode:"auto"`,不持久化、随会话生灭);③ 都没有则走 inbox 兜底。`notify(off:true)` 显式关闭投递后,自动接线也不会复活它。
 - **未注册/投递失败时**:通知堆进 inbox,**任何工具调用的返回都会捎带 `inbox` 字段**——主代理不 poll 也有机会在下一次工具结果里看到,不会静默丢失(inbox 上限 100 条)。
-- **接线要求**:`codex queue` 目标必须是在 app-server daemon 上存活的会话(UUID 或确切会话名;`codex agents` 可查)。注册写入 `<statePath>.notify.json`,桥重启后沿用;换会话用 `notify(thread)` 重注册或 `off` 注销。
-- **注意**:queue 是"排队"语义——主会话正在跑的 turn 不会被半路打断,消息在该 turn 结束时送达;要"立刻催"请配合让主代理周期性做工具调用(任何一次结果都可能捎带 inbox)。
+- **`wait` 是配套的正路**:与其让通知去追主代理,不如主代理自己"睡着等"——`wait` 阻塞到完成/权限/report 任一发生即返回。它声明 `taskSupport: "optional"`,在支持 MCP task 协议的宿主上会被 client 作为**后台任务**执行(完成时结果原生注入,等价 Codex 原生 `wait_agent`);在不支持的宿主上就是普通阻塞调用。queue 通知的价值补在"我不想等,干别的去"那条路。
 
 ## 权限与隔离边界(重要)
 

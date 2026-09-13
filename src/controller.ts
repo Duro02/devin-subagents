@@ -62,6 +62,9 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ID_RE = /^[^\s\\]{1,128}$/;
 const MAX_TEXT = 256_000;
 const QUEUE_CAP = 32;
+/** wait() hard ceiling — matches common host tool timeouts (codex: 1h) */
+const WAIT_MAX_MS = 3_600_000;
+export const WAIT_DEFAULT_MS = 600_000;
 /** Sentinels accepted for mode/model: "use the agent's own default". */
 const NO_SET = new Set(["default", "none"]);
 /** sibling of controller.js in dist/ — the per-session report MCP server */
@@ -131,6 +134,13 @@ export class Controller {
       notifyPath: `${cfg.statePath}.notify.json`,
       codexCommand: cfg.codexCommand ?? "codex",
       thread: cfg.notifyThread,
+      // a child report() also lands in the session event log: it wakes
+      // wait() and stays readable via poll(logs) — same record, three views
+      onEntry: (e) => {
+        if (this.registry.get(e.name)) {
+          this.registry.append(e.name, "report", { text: e.text });
+        }
+      },
       onLog: cfg.onLog,
     });
     this.registry = new Registry(cfg.statePath, {
@@ -218,6 +228,15 @@ export class Controller {
     if (off === true) return this.hub.unregister();
     if (thread !== undefined) return this.hub.register(thread);
     return this.hub.status();
+  }
+
+  /**
+   * Auto-learn the calling session's thread from tool-call metadata
+   * (`_meta.x-codex-turn-metadata.thread_id` on Codex). No-op when a
+   * manual registration or explicit off is in effect.
+   */
+  autoNotify(thread: string): void {
+    this.hub.autoRegister(thread);
   }
 
   /** Undelivered notices, consumed to piggyback on tool results. */
@@ -722,6 +741,59 @@ export class Controller {
       ...base,
       cursor: cur.head, // snapshot version — pass back as `since` to wait on change
       capturedAt: new Date(now).toISOString(),
+      snapshot: buildSnapshot(cur.obs, now),
+    };
+  }
+
+  /**
+   * Block until the subagent needs attention or `timeoutMs` elapses.
+   *
+   * Wake reasons (returned as `wake`):
+   *  - "done":       turn drained to idle — the unit of work finished
+   *  - "permission": operator-mode request is pending approval
+   *  - "report":     the subagent called report() after this wait began
+   *  - "stopped"/"dead": terminal lifecycle states
+   *  - "timeout":    still working; the snapshot shows what it's doing
+   *
+   * A state already needing attention at call time returns immediately —
+   * wait() on an idle subagent answers "is it done?" with no delay.
+   */
+  async wait(name: string, timeoutMs = WAIT_DEFAULT_MS): Promise<Json> {
+    const s = this.require(name);
+    this.flushHidden();
+    const started = Date.now();
+    const deadline = started + Math.max(0, Math.min(timeoutMs, WAIT_MAX_MS));
+    const baseline = s.head;
+    const attention = (cur: SubSession): Json | undefined => {
+      if (cur.pendingPermission) {
+        return { wake: "permission", permission: cur.pendingPermission };
+      }
+      for (let i = cur.events.length - 1; i >= 0; i--) {
+        const e = cur.events[i];
+        if (e.seq <= baseline) break;
+        if (e.kind === "report") return { wake: "report", report: e.data };
+      }
+      if (cur.status === "dead") return { wake: "dead" };
+      if (cur.status === "stopped") return { wake: "stopped" };
+      if (cur.status === "idle" && cur.activeTurn === 0 && !cur.queue.length) {
+        return { wake: "done", lastStopReason: cur.lastStopReason ?? null };
+      }
+      return undefined;
+    };
+    let cur = this.registry.get(name) ?? s;
+    let hit = attention(cur);
+    while (!hit && Date.now() < deadline) {
+      await this.registry.waitForEvent(name, deadline - Date.now());
+      cur = this.registry.get(name) ?? cur; // released mid-wait: last view
+      hit = attention(cur);
+    }
+    const now = Date.now();
+    return {
+      name,
+      status: cur.status,
+      ...(hit ?? { wake: "timeout" }),
+      waitedMs: now - started,
+      cursor: cur.head,
       snapshot: buildSnapshot(cur.obs, now),
     };
   }
