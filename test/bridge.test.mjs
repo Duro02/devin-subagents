@@ -2,13 +2,25 @@
 // (a scripted JSON-RPC stdio agent). No external services.
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync, readFileSync, existsSync } from "node:fs";
+import {
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+  readFileSync,
+  existsSync,
+  chmodSync,
+  appendFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
+import { spawn } from "node:child_process";
+import { createInterface } from "node:readline";
 import { Controller } from "../dist/controller.js";
 import { Registry } from "../dist/registry.js";
 import { loadBridgeConfig } from "../dist/config.js";
+import { SessionDb } from "../dist/sessiondb.js";
+import { NotifyHub } from "../dist/notify.js";
 import {
   createObservation,
   recordObservation,
@@ -33,9 +45,16 @@ function makeCtl(t, opts = {}) {
     modeStrict: opts.modeStrict,
     rpcTimeoutMs: opts.rpcTimeoutMs ?? 2000,
     bufferCap: opts.bufferCap,
+    hideFromSessionList: opts.hideFromSessionList ?? false,
+    sessionDbPath: opts.sessionDbPath,
+    notifyThread: opts.notifyThread,
+    codexCommand: opts.codexCommand,
+    reportTool: opts.reportTool,
+    autoNotify: opts.autoNotify,
+    reportHint: opts.reportHint,
     onLog: (l) => logs.push(l),
   });
-  t.after(() => ctl.acp.kill());
+  t.after(() => ctl.close());
   return { ctl, dir, logs };
 }
 
@@ -209,7 +228,7 @@ test("duplicate names: live, concurrent, and persisted are rejected", async (t) 
     rpcTimeoutMs: 2000,
     onLog: (l) => logs.push(l),
   });
-  t.after(() => ctl2.acp.kill());
+  t.after(() => ctl2.close());
   await assert.rejects(() => ctl2.spawn("dup", "x"), /persisted.*resume/is);
 });
 
@@ -570,6 +589,11 @@ test("config: defaults when no file; cwd default file picked up", async (t) => {
     model: "swe-2-max",
     rpcTimeoutMs: 30000,
     bufferCap: 500,
+    hideFromSessionList: true,
+    codexCommand: "codex",
+    reportTool: true,
+    autoNotify: true,
+    reportHint: true,
   });
   assert.equal(d.specified.size, 0);
   // default file in cwd is auto-discovered
@@ -1212,9 +1236,392 @@ test("resume preserves the session's own model/mode (agent reload + cross-bridge
     rpcTimeoutMs: 2000,
     onLog: () => {},
   });
-  t.after(() => ctl2.acp.kill());
+  t.after(() => ctl2.close());
   const r2 = await ctl2.resume("k");
   assert.equal(r2.status, "idle");
   assert.equal(ctl2.models("k").model, "swe-2-medium");
   assert.equal(ctl2.models("k").mode, "bypass");
+});
+
+// ---------- sessions.hidden marking (sessiondb) ----------
+
+const { DatabaseSync } = await import("node:sqlite").catch(() => ({}));
+
+function makeSessionDbFile(t, cols = "id TEXT PRIMARY KEY, hidden INTEGER NOT NULL DEFAULT 0") {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-sdb-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const dbPath = path.join(dir, "sessions.db");
+  if (DatabaseSync) {
+    const db = new DatabaseSync(dbPath);
+    db.exec(`CREATE TABLE sessions (${cols})`);
+    db.close();
+  }
+  return { dir, dbPath };
+}
+
+test("sessiondb: markHidden flips flag, is idempotent, tolerates missing rows", async (t) => {
+  if (!DatabaseSync) return t.skip("node:sqlite unavailable");
+  const { dbPath } = makeSessionDbFile(t);
+  const sdb = new SessionDb(dbPath);
+  t.after(() => sdb.close());
+  const seed = new DatabaseSync(dbPath);
+  seed.prepare("INSERT INTO sessions (id, hidden) VALUES (?, 0)").run("sess-1");
+  seed.prepare("INSERT INTO sessions (id, hidden) VALUES (?, 0)").run("sess-2");
+  seed.close();
+  assert.deepEqual(sdb.markHidden(["sess-1", "ghost"]), ["sess-1"]);
+  assert.deepEqual(sdb.markHidden(["sess-1", "sess-2"]), ["sess-1", "sess-2"]);
+  const check = new DatabaseSync(dbPath);
+  const rows = check
+    .prepare("SELECT id, hidden FROM sessions ORDER BY id")
+    .all()
+    .map((r) => ({ id: r.id, hidden: r.hidden })); // rows have null prototype
+  check.close();
+  assert.deepEqual(rows, [
+    { id: "sess-1", hidden: 1 },
+    { id: "sess-2", hidden: 1 },
+  ]);
+});
+
+test("sessiondb: missing file never creates one; missing column disables cleanly", async (t) => {
+  if (!DatabaseSync) return t.skip("node:sqlite unavailable");
+  const { dir } = makeSessionDbFile(t);
+  const absent = path.join(dir, "nope.db");
+  const logs = [];
+  const s1 = new SessionDb(absent, (l) => logs.push(l));
+  assert.deepEqual(s1.markHidden(["x"]), []);
+  assert.equal(existsSync(absent), false, "must not create devin's db file");
+  assert.ok(logs.some((l) => /not found/.test(l)));
+
+  const { dbPath } = makeSessionDbFile(t, "id TEXT PRIMARY KEY"); // no hidden col
+  const s2 = new SessionDb(dbPath, (l) => logs.push(l));
+  assert.deepEqual(s2.markHidden(["x"]), []);
+  assert.ok(logs.some((l) => /disabled/.test(l)));
+});
+
+test("hiding: spawned session flips to hidden once its row persists", async (t) => {
+  if (!DatabaseSync) return t.skip("node:sqlite unavailable");
+  const { dbPath } = makeSessionDbFile(t);
+  const { ctl } = makeCtl(t, {
+    hideFromSessionList: true,
+    sessionDbPath: dbPath,
+  });
+  const r = await ctl.spawn("h", "hi");
+  // devin persists the row lazily (first prompt) — pre-row it stays pending
+  let listed = await ctl.list();
+  assert.equal(listed.subagents[0].hidden, false);
+  const db = new DatabaseSync(dbPath);
+  db.prepare("INSERT INTO sessions (id, hidden) VALUES (?, 0)").run(r.sessionId);
+  await ctl.poll("h");
+  assert.equal(
+    db.prepare("SELECT hidden FROM sessions WHERE id = ?").get(r.sessionId)
+      .hidden,
+    1,
+  );
+  listed = await ctl.list();
+  assert.equal(listed.subagents[0].hidden, true);
+  db.close();
+  await untilDone(ctl, "h");
+});
+
+test("hiding: disabled config leaves sessions listed and omits the field", async (t) => {
+  const { ctl } = makeCtl(t, { hideFromSessionList: false });
+  await ctl.spawn("n", "hi");
+  await untilDone(ctl, "n");
+  const listed = await ctl.list();
+  assert.equal(listed.subagents[0].hidden, undefined);
+});
+
+test("config: hideFromSessionList/sessionDbPath parsing", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-cfg-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(
+    path.join(dir, "c.json"),
+    JSON.stringify({ hideFromSessionList: false, sessionDbPath: "db/s.db" }),
+  );
+  const d = loadBridgeConfig(["--config", "c.json"], dir);
+  assert.equal(d.config.hideFromSessionList, false);
+  assert.equal(d.config.sessionDbPath, path.join(dir, "db", "s.db"));
+  assert.ok(d.specified.has("hideFromSessionList"));
+
+  const w = (obj) => {
+    writeFileSync(path.join(dir, "x.json"), obj);
+    return ["--config", path.join(dir, "x.json")];
+  };
+  assert.throws(() => loadBridgeConfig(w('{"hideFromSessionList": "yes"}'), dir), /boolean/);
+  assert.throws(() => loadBridgeConfig(w('{"sessionDbPath": 5}'), dir), /non-empty/);
+});
+
+// ---------- parent notifications (report tool + notify hub) ----------
+
+const CHILD = fileURLToPath(new URL("../dist/child.js", import.meta.url));
+
+/** A fake `codex` binary: logs its argv (one arg per line) to a file. */
+function codexStub(t) {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-codex-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const log = path.join(dir, "args.log");
+  const stub = path.join(dir, "codex-stub.sh");
+  writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$@" >> "${log}"\n`);
+  chmodSync(stub, 0o755);
+  return { stub, log };
+}
+
+const readLines = (p) =>
+  existsSync(p) ? readFileSync(p, "utf8").split("\n").filter(Boolean) : [];
+
+async function untilFile(p, ms = 4000) {
+  const end = Date.now() + ms;
+  for (;;) {
+    if (existsSync(p) && readFileSync(p, "utf8").trim()) {
+      return readFileSync(p, "utf8");
+    }
+    if (Date.now() > end) throw new Error(`timeout waiting for ${p}`);
+    await sleep(20);
+  }
+}
+
+function makeHub(t, dir, opts = {}) {
+  const hub = new NotifyHub({
+    mailboxPath: path.join(dir, "mailbox.jsonl"),
+    notifyPath: path.join(dir, "notify.json"),
+    codexCommand: opts.codexCommand ?? "definitely-not-codex",
+    thread: opts.thread,
+    onLog: () => {},
+  });
+  t.after(() => hub.close());
+  return hub;
+}
+
+test("child: report tool call lands in the mailbox", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-child-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const mailbox = path.join(dir, "mailbox.jsonl");
+  const child = spawn(
+    process.execPath,
+    [CHILD, "--name", "kid", "--mailbox", mailbox],
+    { stdio: ["pipe", "pipe", "pipe"] },
+  );
+  t.after(() => child.kill());
+  const rl = createInterface({ input: child.stdout });
+  const replies = new Map();
+  rl.on("line", (l) => {
+    const m = JSON.parse(l);
+    if (m.id !== undefined) replies.set(m.id, m);
+  });
+  const send = (m) => child.stdin.write(JSON.stringify(m) + "\n");
+  const waitReply = async (id, ms = 4000) => {
+    const end = Date.now() + ms;
+    for (;;) {
+      if (replies.has(id)) return replies.get(id);
+      if (Date.now() > end) throw new Error(`timeout waiting for reply ${id}`);
+      await sleep(15);
+    }
+  };
+  send({
+    jsonrpc: "2.0",
+    id: 1,
+    method: "initialize",
+    params: {
+      protocolVersion: "2025-03-26",
+      capabilities: {},
+      clientInfo: { name: "test", version: "0" },
+    },
+  });
+  const init = await waitReply(1);
+  assert.equal(init.result.serverInfo.name, "devin-subagents-parent");
+  send({ jsonrpc: "2.0", method: "notifications/initialized" });
+  send({
+    jsonrpc: "2.0",
+    id: 2,
+    method: "tools/call",
+    params: { name: "report", arguments: { message: "checkpoint one" } },
+  });
+  const res = await waitReply(2);
+  assert.match(res.result.content[0].text, /reported/);
+  const lines = readLines(mailbox).map((l) => JSON.parse(l));
+  assert.equal(lines.length, 1);
+  assert.equal(lines[0].name, "kid");
+  assert.equal(lines[0].text, "checkpoint one");
+});
+
+test("notify: no thread -> inbox; register flushes via codex queue", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-notify-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { stub, log } = codexStub(t);
+  const hub = makeHub(t, dir, { codexCommand: stub });
+
+  hub.deliver({ name: "a", at: 1, text: "hello parent" });
+  assert.equal(hub.status().inbox, 1);
+
+  hub.register("thread-9");
+  const out = await untilFile(log);
+  assert.match(out, /queue/);
+  assert.match(out, /--thread/);
+  assert.match(out, /thread-9/);
+  assert.match(out, /\[devin-subagents\] a: hello parent/);
+  assert.equal(hub.status().delivered, 1);
+  assert.equal(hub.status().inbox, 0);
+  // thread persisted for a bridge restart
+  assert.match(readFileSync(path.join(dir, "notify.json"), "utf8"), /thread-9/);
+  assert.equal(hub.unregister().thread, null);
+});
+
+test("notify: mailbox lines are drained and delivered", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-notify-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const { stub, log } = codexStub(t);
+  const hub = makeHub(t, dir, { codexCommand: stub, thread: "thread-7" });
+  const mailbox = path.join(dir, "mailbox.jsonl");
+  appendFileSync(
+    mailbox,
+    JSON.stringify({ name: "kid", at: 2, text: "from child" }) + "\n",
+  );
+  hub.drainMailbox();
+  const out = await untilFile(log);
+  assert.match(out, /\[devin-subagents\] kid: from child/);
+  // idempotent: a second drain does not redeliver
+  hub.drainMailbox();
+  await sleep(100);
+  assert.equal(hub.status().delivered, 1);
+});
+
+test("notify: queue failure falls back to inbox, retried on register", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-notify-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const failStub = path.join(dir, "fail.sh");
+  writeFileSync(failStub, "#!/bin/sh\nexit 1\n");
+  chmodSync(failStub, 0o755);
+  const hub = makeHub(t, dir, { codexCommand: failStub, thread: "t-x" });
+  hub.deliver({ name: "a", at: 1, text: "lost?" });
+  const end = Date.now() + 3000;
+  while (hub.status().inbox < 1 && Date.now() < end) await sleep(20);
+  assert.equal(hub.drainInbox()[0].text, "lost?");
+});
+
+test("wiring: spawn injects report MCP + hint; turn_end hits codex queue", async (t) => {
+  const { stub, log } = codexStub(t);
+  const { ctl, dir } = makeCtl(t, {
+    codexCommand: stub,
+    notifyThread: "thread-42",
+    env: (d) => ({ FAKE_ACP_PARAM_LOG: path.join(d, "params.jsonl") }),
+  });
+  await ctl.spawn("w", "do it");
+  await untilDone(ctl, "w");
+
+  const out = await untilFile(log);
+  assert.match(out, /--thread/);
+  assert.match(out, /thread-42/);
+  assert.match(out, /\[devin-subagents\] w: turn 1 ended \(end_turn\)/);
+
+  const params = readLines(path.join(dir, "params.jsonl")).map((l) =>
+    JSON.parse(l),
+  );
+  const nw = params.find((p) => p.method === "session/new");
+  const spec = nw.params.mcpServers[0];
+  assert.equal(spec.name, "devin-subagents");
+  assert.equal(spec.type, "stdio");
+  assert.equal(spec.command, process.execPath);
+  assert.deepEqual(
+    spec.args.filter((a) => a === "--name" || a === "--mailbox").length,
+    2,
+  );
+  // the spawn task carried the report-tool hint
+  const s = ctl.registry.get("w");
+  const ts = s.events.find((e) => e.kind === "turn_start");
+  assert.match(ts.data.text, /`report` tool/);
+});
+
+test("reportTool off: no mcpServers injected and no hint", async (t) => {
+  const { ctl, dir } = makeCtl(t, {
+    reportTool: false,
+    env: (d) => ({ FAKE_ACP_PARAM_LOG: path.join(d, "params.jsonl") }),
+  });
+  await ctl.spawn("x", "plain task");
+  const params = readLines(path.join(dir, "params.jsonl")).map((l) =>
+    JSON.parse(l),
+  );
+  const nw = params.find((p) => p.method === "session/new");
+  assert.deepEqual(nw.params.mcpServers, []);
+  const ts = ctl.registry.get("x").events.find((e) => e.kind === "turn_start");
+  assert.equal(ts.data.text, "plain task");
+  await untilDone(ctl, "x");
+});
+
+test("autoNotify: operator-mode permission_request reaches the queue", async (t) => {
+  const { stub, log } = codexStub(t);
+  const { ctl } = makeCtl(t, {
+    policy: "operator",
+    codexCommand: stub,
+    notifyThread: "th-1",
+  });
+  await ctl.spawn("p", "[[perm]]");
+  await untilEvent(ctl, "p", "permission_request");
+  const out = await untilFile(log);
+  assert.match(out, /requests permission: Run dangerous command/);
+  ctl.permission("p", "allow_once");
+  await untilDone(ctl, "p");
+});
+
+test("inbox: undelivered notices surface via notifyInbox()", async (t) => {
+  const { ctl, dir } = makeCtl(t); // no thread registered
+  appendFileSync(
+    `${dir}/state.json.mailbox.jsonl`,
+    JSON.stringify({ name: "k", at: 1, text: "hi parent" }) + "\n",
+  );
+  const inbox = ctl.notifyInbox();
+  assert.equal(inbox.length, 1);
+  assert.equal(inbox[0].name, "k");
+  assert.equal(inbox[0].text, "hi parent");
+  assert.equal(ctl.notifyInbox().length, 0); // consumed
+});
+
+test("notify tool: register/status/unregister via controller", async (t) => {
+  const { stub, log } = codexStub(t);
+  const { ctl, dir } = makeCtl(t, { codexCommand: stub });
+  assert.equal(ctl.notify().thread, null);
+  const st = ctl.notify("thread-live");
+  assert.equal(st.thread, "thread-live");
+  assert.match(
+    readFileSync(`${dir}/state.json.notify.json`, "utf8"),
+    /thread-live/,
+  );
+  assert.equal(ctl.notify(undefined, true).thread, null);
+});
+
+test("config: notify/report keys parse with defaults and validation", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-cfg-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+
+  const def = loadBridgeConfig([], dir); // no config file
+  assert.equal(def.config.codexCommand, "codex");
+  assert.equal(def.config.reportTool, true);
+  assert.equal(def.config.autoNotify, true);
+  assert.equal(def.config.reportHint, true);
+  assert.equal(def.config.notifyThread, undefined);
+
+  writeFileSync(
+    path.join(dir, "c.json"),
+    JSON.stringify({
+      notifyThread: "abc-123",
+      codexCommand: "./cx",
+      reportTool: false,
+      autoNotify: false,
+      reportHint: false,
+    }),
+  );
+  const d = loadBridgeConfig(["--config", "c.json"], dir);
+  assert.equal(d.config.notifyThread, "abc-123");
+  assert.equal(d.config.codexCommand, path.join(dir, "cx")); // path → resolved
+  assert.equal(d.config.reportTool, false);
+  assert.equal(d.config.autoNotify, false);
+  assert.equal(d.config.reportHint, false);
+
+  const w = (obj) => {
+    writeFileSync(path.join(dir, "x.json"), obj);
+    return ["--config", path.join(dir, "x.json")];
+  };
+  assert.throws(() => loadBridgeConfig(w('{"reportTool": "yes"}'), dir), /boolean/);
+  assert.throws(() => loadBridgeConfig(w('{"autoNotify": 1}'), dir), /boolean/);
+  assert.throws(() => loadBridgeConfig(w('{"notifyThread": " "}'), dir), /non-empty/);
+  assert.throws(() => loadBridgeConfig(w('{"codexCommand": 5}'), dir), /non-empty/);
 });

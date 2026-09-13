@@ -1,9 +1,12 @@
 import { statSync } from "node:fs";
 import path from "node:path";
+import { fileURLToPath } from "node:url";
 import { AcpClient, type Json, type PermissionRequest } from "./acp.js";
 import { projectEvents } from "./project.js";
 import { buildSnapshot } from "./observe.js";
 import { Registry, type SubSession } from "./registry.js";
+import { SessionDb } from "./sessiondb.js";
+import { NotifyHub, type MailEntry } from "./notify.js";
 
 export interface ControllerConfig {
   command: string;
@@ -29,6 +32,29 @@ export interface ControllerConfig {
   rpcTimeoutMs?: number;
   /** per-session event ring buffer size */
   bufferCap?: number;
+  /**
+   * mark managed sessions hidden=1 in devin's session DB so they stay out
+   * of user-facing session lists (/resume, `devin list`, agent-side
+   * session/list). The flag is flipped directly in
+   * `<data-dir>/devin/cli/sessions.db` — `session/new` has no switch for
+   * it. Hidden sessions still `session/load` fine, so bridge resume is
+   * unaffected; the interactive `devin -r <id>` lookup no longer resolves
+   * them. Best-effort: a missing/old-schema DB disables the feature
+   * silently (one log line), never a tool call.
+   */
+  hideFromSessionList: boolean;
+  /** devin session DB override; default = platform data dir path */
+  sessionDbPath?: string;
+  /** codex thread receiving notices via `codex queue` (see notify tool) */
+  notifyThread?: string;
+  /** codex binary for queue delivery (default "codex") */
+  codexCommand?: string;
+  /** inject the `report` MCP tool into subagent sessions (default true) */
+  reportTool?: boolean;
+  /** bridge-side notices on turn_end / permission_request (default true) */
+  autoNotify?: boolean;
+  /** append a report-tool usage hint to the spawn task (default true) */
+  reportHint?: boolean;
   onLog?: (line: string) => void;
 }
 
@@ -38,6 +64,13 @@ const MAX_TEXT = 256_000;
 const QUEUE_CAP = 32;
 /** Sentinels accepted for mode/model: "use the agent's own default". */
 const NO_SET = new Set(["default", "none"]);
+/** sibling of controller.js in dist/ — the per-session report MCP server */
+const CHILD_PATH = fileURLToPath(new URL("child.js", import.meta.url));
+const REPORT_HINT =
+  "\n\n[orchestration] This session exposes a `report` tool: call " +
+  "report(message) to send a progress checkpoint, question, or final " +
+  "summary to the agent that spawned you. It is fire-and-forget — do " +
+  "not wait for a reply.";
 
 function vName(name: string): void {
   if (typeof name !== "string" || !NAME_RE.test(name)) {
@@ -84,8 +117,22 @@ export class Controller {
   private agentModels?: string[];
   private agentMode?: string;
   private agentModel?: string;
+  private sessionDb?: SessionDb;
+  /** session ids offered to sessionDb but not yet confirmed hidden */
+  private hiddenPending = new Set<string>();
+  /** session ids confirmed hidden (by us or already flagged) */
+  private hiddenDone = new Set<string>();
+  /** subagent-originated notices → parent session (queue / inbox) */
+  private hub: NotifyHub;
 
   constructor(private cfg: ControllerConfig) {
+    this.hub = new NotifyHub({
+      mailboxPath: `${cfg.statePath}.mailbox.jsonl`,
+      notifyPath: `${cfg.statePath}.notify.json`,
+      codexCommand: cfg.codexCommand ?? "codex",
+      thread: cfg.notifyThread,
+      onLog: cfg.onLog,
+    });
     this.registry = new Registry(cfg.statePath, {
       bufferCap: cfg.bufferCap,
       onLog: cfg.onLog,
@@ -116,6 +163,72 @@ export class Controller {
     this.acp.onAgentExit = (code) => this.registry.markAllDead(code);
     this.acp.onLog =
       cfg.onLog ?? ((line) => process.stderr.write(`[devin] ${line}\n`));
+    if (cfg.hideFromSessionList) {
+      this.sessionDb = new SessionDb(
+        cfg.sessionDbPath ?? SessionDb.defaultPath(),
+        cfg.onLog,
+      );
+    }
+  }
+
+  /**
+   * Offer a session id for hiding; rows persist lazily (first prompt), so
+   * unconfirmed ids stay pending and every flushHidden() call retries.
+   */
+  private trackHidden(sessionId: string): void {
+    if (!this.sessionDb || this.hiddenDone.has(sessionId)) return;
+    this.hiddenPending.add(sessionId);
+    this.flushHidden();
+  }
+
+  private flushHidden(): void {
+    if (!this.sessionDb || this.hiddenPending.size === 0) return;
+    for (const id of this.sessionDb.markHidden([...this.hiddenPending])) {
+      this.hiddenPending.delete(id);
+      this.hiddenDone.add(id);
+    }
+  }
+
+  /**
+   * MCP server spec injected into every subagent session: the `report`
+   * tool that lets the subagent push notices to the parent agent.
+   * Verified shape for devin acp (stdio variant).
+   */
+  private childMcpSpec(name: string): Json[] {
+    if (this.cfg.reportTool === false) return [];
+    return [
+      {
+        type: "stdio",
+        name: "devin-subagents",
+        command: process.execPath,
+        args: [
+          CHILD_PATH,
+          "--name",
+          name,
+          "--mailbox",
+          this.hub.mailboxPath,
+        ],
+        env: [],
+      },
+    ];
+  }
+
+  /** Agent-facing: register/query the codex thread receiving notices. */
+  notify(thread?: string, off?: boolean): Json {
+    if (off === true) return this.hub.unregister();
+    if (thread !== undefined) return this.hub.register(thread);
+    return this.hub.status();
+  }
+
+  /** Undelivered notices, consumed to piggyback on tool results. */
+  notifyInbox(): MailEntry[] {
+    return this.hub.drainInbox();
+  }
+
+  /** Release the mailbox watcher and the agent process. */
+  close(): void {
+    this.hub.close();
+    this.acp.kill();
   }
 
   private bySessionId(sessionId: string) {
@@ -164,6 +277,16 @@ export class Controller {
         toolCall: req.toolCall,
         options: req.options,
       });
+      if (this.cfg.autoNotify !== false) {
+        const tool = String(
+          req.toolCall.title ?? req.toolCall.toolCallId ?? "tool call",
+        );
+        this.hub.deliver({
+          name: s.name,
+          at: Date.now(),
+          text: `requests permission: ${tool} — approve/deny via the permission tool`,
+        });
+      }
       return;
     }
     const optionId =
@@ -228,6 +351,16 @@ export class Controller {
     // records lastStopReason even when already idle (e.g. resumed while the
     // cancelled prompt was still settling)
     this.registry.mark(s.name, "idle", stopReason);
+    // The session went quiet: queue empty, nothing running. A "cancelled"
+    // settle is the bridge's own interrupt/stop — the caller already knows.
+    if (this.cfg.autoNotify !== false && stopReason !== "cancelled") {
+      const tail = s.obs.latestText?.text.slice(-400);
+      this.hub.deliver({
+        name: s.name,
+        at: Date.now(),
+        text: `turn ${turn} ended (${stopReason})${tail ? ` — ${tail}` : ""}`,
+      });
+    }
   }
 
   /** Start the next queued prompt if nothing is running/configuring. */
@@ -442,7 +575,10 @@ export class Controller {
     s.cwd = workdir;
     try {
       await this.acp.ensureStarted();
-      const res = await this.acp.newSession(workdir);
+      const res = await this.acp.newSession(
+        workdir,
+        this.childMcpSpec(name),
+      );
       const sessionId = String(res.sessionId);
       // Keep status "starting" through capability setup: a racing send
       // must queue behind the initial prompt, not overtake it before the
@@ -462,7 +598,12 @@ export class Controller {
         /*requireModel*/ true,
       );
       this.registry.activate(name, sessionId, workdir);
-      this.runTurn(s, task);
+      this.trackHidden(sessionId);
+      const hint =
+        this.cfg.reportTool !== false && this.cfg.reportHint !== false
+          ? REPORT_HINT
+          : "";
+      this.runTurn(s, task + hint);
       return {
         name,
         sessionId,
@@ -534,6 +675,7 @@ export class Controller {
     limit?: number,
   ): Promise<Json> {
     const s = this.require(name);
+    this.flushHidden();
     if (since !== undefined && (!Number.isInteger(since) || since < 0)) {
       throw new Error(`since must be a non-negative integer, got ${since}`);
     }
@@ -627,6 +769,7 @@ export class Controller {
         // session is still busy: report running so poll/send reflect that
         // work remains until the reply lands and the queue drains.
         const busy = s.activeTurn !== 0;
+        this.trackHidden(s.sessionId);
         this.registry.mark(name, busy ? "running" : "idle");
         this.registry.append(name, "resumed", {
           sessionId: s.sessionId,
@@ -645,9 +788,14 @@ export class Controller {
       const ownMode = s.currentMode;
       const ownModel = s.currentModel;
       await this.acp.ensureStarted();
-      const res = await this.acp.loadSession(s.sessionId, s.cwd);
+      const res = await this.acp.loadSession(
+        s.sessionId,
+        s.cwd,
+        this.childMcpSpec(name),
+      );
       this.recordCaps(s, res);
       await this.applyCaps(s, ownMode, ownModel, false, false);
+      this.trackHidden(s.sessionId);
       this.registry.mark(name, "idle");
       this.registry.append(name, "resumed", { sessionId: s.sessionId });
       return { name, sessionId: s.sessionId, status: "idle" };
@@ -658,8 +806,13 @@ export class Controller {
     const claim = this.registry.claim(name);
     try {
       await this.acp.ensureStarted();
-      const res = await this.acp.loadSession(rec.sessionId, rec.cwd);
+      const res = await this.acp.loadSession(
+        rec.sessionId,
+        rec.cwd,
+        this.childMcpSpec(name),
+      );
       const s2 = this.registry.activate(name, rec.sessionId, rec.cwd);
+      this.trackHidden(s2.sessionId);
       this.recordCaps(s2, res);
       // re-assert the session's persisted selection, not bridge defaults
       await this.applyCaps(s2, rec.mode, rec.model, false, false);
@@ -845,6 +998,7 @@ export class Controller {
   }
 
   async list(): Promise<Json> {
+    this.flushHidden();
     const live = this.registry.names().map((n) => {
       const s = this.registry.get(n)!;
       return {
@@ -857,6 +1011,9 @@ export class Controller {
         model: s.currentModel,
         turn: s.turnSeq,
         queued: s.queue.length,
+        ...(this.sessionDb
+          ? { hidden: this.hiddenDone.has(s.sessionId) }
+          : {}),
       };
     });
     const persisted = Object.entries(this.registry.persisted())

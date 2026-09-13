@@ -6,5 +6,10 @@
   "mode": "smart",
   "model": "swe-2-max",
   "rpcTimeoutMs": 30000,
-  "bufferCap": 500
+  "bufferCap": 500,
+  "hideFromSessionList": true,
+  "codexCommand": "codex",
+  "reportTool": true,
+  "autoNotify": true,
+  "reportHint": true
 }

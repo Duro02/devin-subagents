@@ -37,6 +37,36 @@ export interface BridgeConfig {
   rpcTimeoutMs: number;
   /** per-session event ring buffer size */
   bufferCap: number;
+  /**
+   * mark managed sessions hidden=1 in devin's session DB so they stay out
+   * of user-facing lists (/resume, `devin list`, agent `session/list`)
+   */
+  hideFromSessionList: boolean;
+  /** devin session DB override (default: platform data dir path) */
+  sessionDbPath?: string;
+  /**
+   * Codex thread (session UUID or exact name) receiving subagent notices
+   * via `codex queue`. When unset, notices wait in the inbox and ride
+   * along on tool results instead of pushing.
+   */
+  notifyThread?: string;
+  /** codex binary used for `codex queue` delivery (default: "codex") */
+  codexCommand: string;
+  /**
+   * inject a per-session MCP server exposing `report(message)` into every
+   * subagent via session/new|load mcpServers (default: true)
+   */
+  reportTool: boolean;
+  /**
+   * bridge-side notices for turn completion and permission requests
+   * (default: true)
+   */
+  autoNotify: boolean;
+  /**
+   * append a short "you have a report tool" hint to the spawn task so the
+   * subagent knows it exists (default: true; requires reportTool)
+   */
+  reportHint: boolean;
 }
 
 const ALLOWED_KEYS = new Set([
@@ -48,9 +78,16 @@ const ALLOWED_KEYS = new Set([
   "model",
   "rpcTimeoutMs",
   "bufferCap",
+  "hideFromSessionList",
+  "sessionDbPath",
+  "notifyThread",
+  "codexCommand",
+  "reportTool",
+  "autoNotify",
+  "reportHint",
 ]);
 
-const DEFAULTS: Omit<BridgeConfig, "statePath"> = {
+const DEFAULTS: Omit<BridgeConfig, "statePath" | "sessionDbPath"> = {
   command: "devin",
   args: ["acp"],
   permission: "operator",
@@ -58,6 +95,11 @@ const DEFAULTS: Omit<BridgeConfig, "statePath"> = {
   model: "swe-2-max",
   rpcTimeoutMs: 30_000,
   bufferCap: 500,
+  hideFromSessionList: true,
+  codexCommand: "codex",
+  reportTool: true,
+  autoNotify: true,
+  reportHint: true,
 };
 
 export interface LoadedConfig {
@@ -79,7 +121,9 @@ Usage: node dist/index.js [--config PATH] [--help]
   --help          show this text
 
 Config keys (all optional): command, args, statePath, permission
-("auto"|"always"|"operator"), mode, model, rpcTimeoutMs, bufferCap.
+("auto"|"always"|"operator"), mode, model, rpcTimeoutMs, bufferCap,
+hideFromSessionList, sessionDbPath, notifyThread, codexCommand,
+reportTool, autoNotify, reportHint.
 Environment variables are NOT read as bridge settings.
 `;
 
@@ -209,6 +253,45 @@ export function loadBridgeConfig(
         fail(file, `${k} must be an integer >= 1`);
       }
       cfg[k] = o[k] as number;
+      specified.add(k);
+    }
+  }
+  if (o.hideFromSessionList !== undefined) {
+    if (typeof o.hideFromSessionList !== "boolean") {
+      fail(file, `hideFromSessionList must be a boolean`);
+    }
+    cfg.hideFromSessionList = o.hideFromSessionList;
+    specified.add("hideFromSessionList");
+  }
+  if (o.sessionDbPath !== undefined) {
+    if (typeof o.sessionDbPath !== "string" || !o.sessionDbPath.trim()) {
+      fail(file, `sessionDbPath must be a non-empty string`);
+    }
+    cfg.sessionDbPath = rel(o.sessionDbPath);
+    specified.add("sessionDbPath");
+  }
+  if (o.notifyThread !== undefined) {
+    if (typeof o.notifyThread !== "string" || !o.notifyThread.trim()) {
+      fail(file, `notifyThread must be a non-empty string`);
+    }
+    cfg.notifyThread = o.notifyThread;
+    specified.add("notifyThread");
+  }
+  if (o.codexCommand !== undefined) {
+    if (typeof o.codexCommand !== "string" || !o.codexCommand.trim()) {
+      fail(file, `codexCommand must be a non-empty string`);
+    }
+    cfg.codexCommand = /[/\\]/.test(o.codexCommand)
+      ? rel(o.codexCommand)
+      : o.codexCommand;
+    specified.add("codexCommand");
+  }
+  for (const k of ["reportTool", "autoNotify", "reportHint"] as const) {
+    if (o[k] !== undefined) {
+      if (typeof o[k] !== "boolean") {
+        fail(file, `${k} must be a boolean`);
+      }
+      cfg[k] = o[k] as boolean;
       specified.add(k);
     }
   }
