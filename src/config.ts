@@ -37,6 +37,13 @@ export interface BridgeConfig {
   rpcTimeoutMs: number;
   /** per-session event ring buffer size */
   bufferCap: number;
+  /**
+   * mark managed sessions hidden=1 in devin's session DB so they stay out
+   * of user-facing lists (/resume, `devin list`, agent `session/list`)
+   */
+  hideFromSessionList: boolean;
+  /** devin session DB override (default: platform data dir path) */
+  sessionDbPath?: string;
 }
 
 const ALLOWED_KEYS = new Set([
@@ -48,9 +55,11 @@ const ALLOWED_KEYS = new Set([
   "model",
   "rpcTimeoutMs",
   "bufferCap",
+  "hideFromSessionList",
+  "sessionDbPath",
 ]);
 
-const DEFAULTS: Omit<BridgeConfig, "statePath"> = {
+const DEFAULTS: Omit<BridgeConfig, "statePath" | "sessionDbPath"> = {
   command: "devin",
   args: ["acp"],
   permission: "operator",
@@ -58,6 +67,7 @@ const DEFAULTS: Omit<BridgeConfig, "statePath"> = {
   model: "swe-2-max",
   rpcTimeoutMs: 30_000,
   bufferCap: 500,
+  hideFromSessionList: true,
 };
 
 export interface LoadedConfig {
@@ -79,7 +89,8 @@ Usage: node dist/index.js [--config PATH] [--help]
   --help          show this text
 
 Config keys (all optional): command, args, statePath, permission
-("auto"|"always"|"operator"), mode, model, rpcTimeoutMs, bufferCap.
+("auto"|"always"|"operator"), mode, model, rpcTimeoutMs, bufferCap,
+hideFromSessionList, sessionDbPath.
 Environment variables are NOT read as bridge settings.
 `;
 
@@ -211,6 +222,20 @@ export function loadBridgeConfig(
       cfg[k] = o[k] as number;
       specified.add(k);
     }
+  }
+  if (o.hideFromSessionList !== undefined) {
+    if (typeof o.hideFromSessionList !== "boolean") {
+      fail(file, `hideFromSessionList must be a boolean`);
+    }
+    cfg.hideFromSessionList = o.hideFromSessionList;
+    specified.add("hideFromSessionList");
+  }
+  if (o.sessionDbPath !== undefined) {
+    if (typeof o.sessionDbPath !== "string" || !o.sessionDbPath.trim()) {
+      fail(file, `sessionDbPath must be a non-empty string`);
+    }
+    cfg.sessionDbPath = rel(o.sessionDbPath);
+    specified.add("sessionDbPath");
   }
   return { config: cfg, file, specified, help: false };
 }

@@ -9,6 +9,7 @@ import { fileURLToPath } from "node:url";
 import { Controller } from "../dist/controller.js";
 import { Registry } from "../dist/registry.js";
 import { loadBridgeConfig } from "../dist/config.js";
+import { SessionDb } from "../dist/sessiondb.js";
 import {
   createObservation,
   recordObservation,
@@ -33,6 +34,8 @@ function makeCtl(t, opts = {}) {
     modeStrict: opts.modeStrict,
     rpcTimeoutMs: opts.rpcTimeoutMs ?? 2000,
     bufferCap: opts.bufferCap,
+    hideFromSessionList: opts.hideFromSessionList ?? false,
+    sessionDbPath: opts.sessionDbPath,
     onLog: (l) => logs.push(l),
   });
   t.after(() => ctl.acp.kill());
@@ -570,6 +573,7 @@ test("config: defaults when no file; cwd default file picked up", async (t) => {
     model: "swe-2-max",
     rpcTimeoutMs: 30000,
     bufferCap: 500,
+    hideFromSessionList: true,
   });
   assert.equal(d.specified.size, 0);
   // default file in cwd is auto-discovered
@@ -1217,4 +1221,112 @@ test("resume preserves the session's own model/mode (agent reload + cross-bridge
   assert.equal(r2.status, "idle");
   assert.equal(ctl2.models("k").model, "swe-2-medium");
   assert.equal(ctl2.models("k").mode, "bypass");
+});
+
+// ---------- sessions.hidden marking (sessiondb) ----------
+
+const { DatabaseSync } = await import("node:sqlite").catch(() => ({}));
+
+function makeSessionDbFile(t, cols = "id TEXT PRIMARY KEY, hidden INTEGER NOT NULL DEFAULT 0") {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-sdb-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const dbPath = path.join(dir, "sessions.db");
+  if (DatabaseSync) {
+    const db = new DatabaseSync(dbPath);
+    db.exec(`CREATE TABLE sessions (${cols})`);
+    db.close();
+  }
+  return { dir, dbPath };
+}
+
+test("sessiondb: markHidden flips flag, is idempotent, tolerates missing rows", async (t) => {
+  if (!DatabaseSync) return t.skip("node:sqlite unavailable");
+  const { dbPath } = makeSessionDbFile(t);
+  const sdb = new SessionDb(dbPath);
+  t.after(() => sdb.close());
+  const seed = new DatabaseSync(dbPath);
+  seed.prepare("INSERT INTO sessions (id, hidden) VALUES (?, 0)").run("sess-1");
+  seed.prepare("INSERT INTO sessions (id, hidden) VALUES (?, 0)").run("sess-2");
+  seed.close();
+  assert.deepEqual(sdb.markHidden(["sess-1", "ghost"]), ["sess-1"]);
+  assert.deepEqual(sdb.markHidden(["sess-1", "sess-2"]), ["sess-1", "sess-2"]);
+  const check = new DatabaseSync(dbPath);
+  const rows = check
+    .prepare("SELECT id, hidden FROM sessions ORDER BY id")
+    .all()
+    .map((r) => ({ id: r.id, hidden: r.hidden })); // rows have null prototype
+  check.close();
+  assert.deepEqual(rows, [
+    { id: "sess-1", hidden: 1 },
+    { id: "sess-2", hidden: 1 },
+  ]);
+});
+
+test("sessiondb: missing file never creates one; missing column disables cleanly", async (t) => {
+  if (!DatabaseSync) return t.skip("node:sqlite unavailable");
+  const { dir } = makeSessionDbFile(t);
+  const absent = path.join(dir, "nope.db");
+  const logs = [];
+  const s1 = new SessionDb(absent, (l) => logs.push(l));
+  assert.deepEqual(s1.markHidden(["x"]), []);
+  assert.equal(existsSync(absent), false, "must not create devin's db file");
+  assert.ok(logs.some((l) => /not found/.test(l)));
+
+  const { dbPath } = makeSessionDbFile(t, "id TEXT PRIMARY KEY"); // no hidden col
+  const s2 = new SessionDb(dbPath, (l) => logs.push(l));
+  assert.deepEqual(s2.markHidden(["x"]), []);
+  assert.ok(logs.some((l) => /disabled/.test(l)));
+});
+
+test("hiding: spawned session flips to hidden once its row persists", async (t) => {
+  if (!DatabaseSync) return t.skip("node:sqlite unavailable");
+  const { dbPath } = makeSessionDbFile(t);
+  const { ctl } = makeCtl(t, {
+    hideFromSessionList: true,
+    sessionDbPath: dbPath,
+  });
+  const r = await ctl.spawn("h", "hi");
+  // devin persists the row lazily (first prompt) — pre-row it stays pending
+  let listed = await ctl.list();
+  assert.equal(listed.subagents[0].hidden, false);
+  const db = new DatabaseSync(dbPath);
+  db.prepare("INSERT INTO sessions (id, hidden) VALUES (?, 0)").run(r.sessionId);
+  await ctl.poll("h");
+  assert.equal(
+    db.prepare("SELECT hidden FROM sessions WHERE id = ?").get(r.sessionId)
+      .hidden,
+    1,
+  );
+  listed = await ctl.list();
+  assert.equal(listed.subagents[0].hidden, true);
+  db.close();
+  await untilDone(ctl, "h");
+});
+
+test("hiding: disabled config leaves sessions listed and omits the field", async (t) => {
+  const { ctl } = makeCtl(t, { hideFromSessionList: false });
+  await ctl.spawn("n", "hi");
+  await untilDone(ctl, "n");
+  const listed = await ctl.list();
+  assert.equal(listed.subagents[0].hidden, undefined);
+});
+
+test("config: hideFromSessionList/sessionDbPath parsing", async (t) => {
+  const dir = mkdtempSync(path.join(tmpdir(), "subagents-cfg-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  writeFileSync(
+    path.join(dir, "c.json"),
+    JSON.stringify({ hideFromSessionList: false, sessionDbPath: "db/s.db" }),
+  );
+  const d = loadBridgeConfig(["--config", "c.json"], dir);
+  assert.equal(d.config.hideFromSessionList, false);
+  assert.equal(d.config.sessionDbPath, path.join(dir, "db", "s.db"));
+  assert.ok(d.specified.has("hideFromSessionList"));
+
+  const w = (obj) => {
+    writeFileSync(path.join(dir, "x.json"), obj);
+    return ["--config", path.join(dir, "x.json")];
+  };
+  assert.throws(() => loadBridgeConfig(w('{"hideFromSessionList": "yes"}'), dir), /boolean/);
+  assert.throws(() => loadBridgeConfig(w('{"sessionDbPath": 5}'), dir), /non-empty/);
 });

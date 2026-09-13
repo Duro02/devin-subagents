@@ -161,7 +161,8 @@ devin-subagents [--config PATH] [--help]
   "mode": "smart",
   "model": "swe-2-max",
   "rpcTimeoutMs": 30000,
-  "bufferCap": 500
+  "bufferCap": 500,
+  "hideFromSessionList": true
 }
 ```
 
@@ -175,11 +176,20 @@ devin-subagents [--config PATH] [--help]
 | `model` | `"swe-2-max"` | `session/new` 时应用并要求确认的默认 model(真实 ID:`swe-2-medium`/`swe-2-high`/`swe-2-max`,用 `models` 工具看 agent 实际广告值;无单独的 reasoning 选项) |
 | `rpcTimeoutMs` | `30000` | 非 `session/prompt` 的 RPC 超时;prompt 不设超时(turn 可以跑很久) |
 | `bufferCap` | `500` | 每个会话的事件环形缓冲上限 |
+| `hideFromSessionList` | `true` | 把桥管理的会话在 devin session DB 里标记 `hidden=1`,使其不出现在 `/resume`、`devin list`、agent `session/list` 中(见下) |
+| `sessionDbPath` | 平台数据目录(`~/.local/share/devin/cli/sessions.db`,macOS 为 `~/Library/Application Support/devin/cli/sessions.db`,尊重 `XDG_DATA_HOME`/`APPDATA`) | devin session DB 路径覆盖;相对路径相对配置文件目录 |
 
 - **schema 严格**:未知键、错误类型、非法 JSON 都直接拒绝;显式 `--config` 的文件不存在也报错。
 - **优先级**:`spawn` 的 `mode`/`model` 参数 > 配置文件值 > 内置默认。**文件里写明的值是"刻意配置"**:agent 未广告或确认值不符时 spawn 直接报错。model 无论来源都要求精确确认(内置默认也不例外);内置默认 mode 不被支持则记 `mode_skipped` 继续跑。
 - **model 应用路径**:devin ACP 没有 `session/set_model`,也不吃 CLI `--model`——桥在 `session/new` 后、**任何 prompt 之前**用 `session/set_config_option {configId:"model", value}` 应用,并要求返回 `configOptions` 的 `currentValue` **精确等于请求值**;不符、无回执或 agent 未广告都直接失败(内置默认也一样——绝不让会话悄悄跑在一个没选过的 ambient model 上)。`resume` 不套默认值:statePath 里随会话落盘的 mode/model 会在 `session/load` 后重新断言。因此继承来的 `DEVIN_MODEL` 环境变量不可能悄悄生效,改了配置的会话也不会被 resume 洗掉。
 - `spawn`/`list`/`poll`/`models` 返回值里的 `mode`/`model` 均为 agent 侧确认值。
+
+### `hidden` 标记的行为与边界
+
+- `/resume`、`devin list`、ACP `session/list` 都过滤 `hidden = 0`;置位后子代理会话从所有用户可见列表消失。`session/load` **不受影响**——桥的 `resume` 工具照常恢复隐藏会话。
+- 副作用:交互式 `devin -r <id>` / `/resume <id>` 的 id 前缀解析同样过滤 `hidden=0`,即隐藏会话无法从 CLI 手动恢复——这是"隐藏"语义的组成部分。要手动捞回:`sqlite3 ~/.local/share/devin/cli/sessions.db "UPDATE sessions SET hidden=0 WHERE id='<sessionId>'"`。
+- 会话行是**惰性持久化**的(首个 prompt 落盘才插行),所以桥在 spawn 后把 sessionId 记入待置位集合,在每次 `poll`/`list`/`resume` 时幂等重试,直到行出现为止;`list()` 的 `subagents[].hidden` 字段反映是否已确认置位。
+- 实现是"尽力而为"的旁路写入:DB 缺失、老版本 schema 没有 `hidden` 列(Devin V15 migration 才引入)、`node:sqlite` 不可用(Node < 22.5)时功能自动禁用,只记一条 stderr 日志,绝不阻塞工具调用。WAL 模式下一条短 `UPDATE` 与 devin 自身写入并发安全,且 devin 从不在 insert 后改写该列,置位不会被覆盖。
 
 ## 权限与隔离边界(重要)
 

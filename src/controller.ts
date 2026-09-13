@@ -4,6 +4,7 @@ import { AcpClient, type Json, type PermissionRequest } from "./acp.js";
 import { projectEvents } from "./project.js";
 import { buildSnapshot } from "./observe.js";
 import { Registry, type SubSession } from "./registry.js";
+import { SessionDb } from "./sessiondb.js";
 
 export interface ControllerConfig {
   command: string;
@@ -29,6 +30,19 @@ export interface ControllerConfig {
   rpcTimeoutMs?: number;
   /** per-session event ring buffer size */
   bufferCap?: number;
+  /**
+   * mark managed sessions hidden=1 in devin's session DB so they stay out
+   * of user-facing session lists (/resume, `devin list`, agent-side
+   * session/list). The flag is flipped directly in
+   * `<data-dir>/devin/cli/sessions.db` — `session/new` has no switch for
+   * it. Hidden sessions still `session/load` fine, so bridge resume is
+   * unaffected; the interactive `devin -r <id>` lookup no longer resolves
+   * them. Best-effort: a missing/old-schema DB disables the feature
+   * silently (one log line), never a tool call.
+   */
+  hideFromSessionList: boolean;
+  /** devin session DB override; default = platform data dir path */
+  sessionDbPath?: string;
   onLog?: (line: string) => void;
 }
 
@@ -84,6 +98,11 @@ export class Controller {
   private agentModels?: string[];
   private agentMode?: string;
   private agentModel?: string;
+  private sessionDb?: SessionDb;
+  /** session ids offered to sessionDb but not yet confirmed hidden */
+  private hiddenPending = new Set<string>();
+  /** session ids confirmed hidden (by us or already flagged) */
+  private hiddenDone = new Set<string>();
 
   constructor(private cfg: ControllerConfig) {
     this.registry = new Registry(cfg.statePath, {
@@ -116,6 +135,30 @@ export class Controller {
     this.acp.onAgentExit = (code) => this.registry.markAllDead(code);
     this.acp.onLog =
       cfg.onLog ?? ((line) => process.stderr.write(`[devin] ${line}\n`));
+    if (cfg.hideFromSessionList) {
+      this.sessionDb = new SessionDb(
+        cfg.sessionDbPath ?? SessionDb.defaultPath(),
+        cfg.onLog,
+      );
+    }
+  }
+
+  /**
+   * Offer a session id for hiding; rows persist lazily (first prompt), so
+   * unconfirmed ids stay pending and every flushHidden() call retries.
+   */
+  private trackHidden(sessionId: string): void {
+    if (!this.sessionDb || this.hiddenDone.has(sessionId)) return;
+    this.hiddenPending.add(sessionId);
+    this.flushHidden();
+  }
+
+  private flushHidden(): void {
+    if (!this.sessionDb || this.hiddenPending.size === 0) return;
+    for (const id of this.sessionDb.markHidden([...this.hiddenPending])) {
+      this.hiddenPending.delete(id);
+      this.hiddenDone.add(id);
+    }
   }
 
   private bySessionId(sessionId: string) {
@@ -462,6 +505,7 @@ export class Controller {
         /*requireModel*/ true,
       );
       this.registry.activate(name, sessionId, workdir);
+      this.trackHidden(sessionId);
       this.runTurn(s, task);
       return {
         name,
@@ -534,6 +578,7 @@ export class Controller {
     limit?: number,
   ): Promise<Json> {
     const s = this.require(name);
+    this.flushHidden();
     if (since !== undefined && (!Number.isInteger(since) || since < 0)) {
       throw new Error(`since must be a non-negative integer, got ${since}`);
     }
@@ -627,6 +672,7 @@ export class Controller {
         // session is still busy: report running so poll/send reflect that
         // work remains until the reply lands and the queue drains.
         const busy = s.activeTurn !== 0;
+        this.trackHidden(s.sessionId);
         this.registry.mark(name, busy ? "running" : "idle");
         this.registry.append(name, "resumed", {
           sessionId: s.sessionId,
@@ -648,6 +694,7 @@ export class Controller {
       const res = await this.acp.loadSession(s.sessionId, s.cwd);
       this.recordCaps(s, res);
       await this.applyCaps(s, ownMode, ownModel, false, false);
+      this.trackHidden(s.sessionId);
       this.registry.mark(name, "idle");
       this.registry.append(name, "resumed", { sessionId: s.sessionId });
       return { name, sessionId: s.sessionId, status: "idle" };
@@ -660,6 +707,7 @@ export class Controller {
       await this.acp.ensureStarted();
       const res = await this.acp.loadSession(rec.sessionId, rec.cwd);
       const s2 = this.registry.activate(name, rec.sessionId, rec.cwd);
+      this.trackHidden(s2.sessionId);
       this.recordCaps(s2, res);
       // re-assert the session's persisted selection, not bridge defaults
       await this.applyCaps(s2, rec.mode, rec.model, false, false);
@@ -845,6 +893,7 @@ export class Controller {
   }
 
   async list(): Promise<Json> {
+    this.flushHidden();
     const live = this.registry.names().map((n) => {
       const s = this.registry.get(n)!;
       return {
@@ -857,6 +906,9 @@ export class Controller {
         model: s.currentModel,
         turn: s.turnSeq,
         queued: s.queue.length,
+        ...(this.sessionDb
+          ? { hidden: this.hiddenDone.has(s.sessionId) }
+          : {}),
       };
     });
     const persisted = Object.entries(this.registry.persisted())
