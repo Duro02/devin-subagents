@@ -1,12 +1,9 @@
-import { spawn } from "node:child_process";
 import {
   closeSync,
   existsSync,
   mkdirSync,
   openSync,
-  readFileSync,
   readSync,
-  renameSync,
   statSync,
   watch,
   writeFileSync,
@@ -23,14 +20,8 @@ export interface MailEntry {
 export interface NotifyOptions {
   /** append-only file children (and the bridge) write notices into */
   mailboxPath: string;
-  /** small JSON file persisting the registered codex thread */
-  notifyPath: string;
-  /** codex binary for `codex queue` delivery */
-  codexCommand: string;
-  /** seed thread from config (static setups) */
-  thread?: string;
   /**
-   * called for every parsed mailbox entry (in addition to delivery) —
+   * called for every parsed mailbox entry (in addition to inbox) —
    * the controller feeds these into the session event log so `wait`
    * and `poll logs` can observe report() calls
    */
@@ -39,10 +30,7 @@ export interface NotifyOptions {
 }
 
 const INBOX_CAP = 100;
-const MSG_CAP = 1800;
 const MAILBOX_ROTATE = 1_000_000;
-/** after a queue failure, hold off retrying for this long */
-const QUEUE_RETRY_MS = 60_000;
 
 /**
  * Delivery hub for subagent-originated notices.
@@ -51,42 +39,24 @@ const QUEUE_RETRY_MS = 60_000;
  * mailbox file; an fs.watch drains it) and bridge-side events (turn_end,
  * permission_request) delivered directly.
  *
- * Sink order: when a codex thread is registered (`notify` tool or config),
- * each entry is pushed via `codex queue --thread <t> --message <m>` — the
- * message lands in the parent session as a queued user message. Without a
- * thread, or when queue delivery fails, entries pile into an inbox that
- * tool results piggyback (`inbox` field) so nothing is silently lost.
+ * Sink: an in-memory inbox that tool results piggyback (`inbox` field) so
+ * nothing is silently lost. Push-style delivery is intentionally left to
+ * each harness — the bridge only guarantees the generic inbox path.
  */
 export class NotifyHub {
   readonly mailboxPath: string;
-  private notifyPath: string;
-  private codexCommand: string;
   private onEntry?: (e: MailEntry) => void;
   private onLog?: (line: string) => void;
-  private thread?: string;
-  /**
-   * none: no thread known · auto: learned from tool-call _meta ·
-   * manual: notify tool / config / persisted file · off: explicit
-   * unregister — auto-capture never overrides manual or off.
-   */
-  private mode: "none" | "auto" | "manual" | "off" = "none";
   private inbox: MailEntry[] = [];
-  private delivered = 0;
   private offset = 0;
   private remainder = "";
   private watcher?: FSWatcher;
   private drainTimer?: NodeJS.Timeout;
-  private queueRetryAt = 0;
-  private logged = new Set<string>();
 
   constructor(opts: NotifyOptions) {
     this.mailboxPath = opts.mailboxPath;
-    this.notifyPath = opts.notifyPath;
-    this.codexCommand = opts.codexCommand;
     this.onEntry = opts.onEntry;
     this.onLog = opts.onLog;
-    this.thread = opts.thread ?? this.loadThread();
-    if (this.thread) this.mode = "manual";
 
     // The mailbox must exist before it can be watched.
     try {
@@ -100,39 +70,8 @@ export class NotifyHub {
     }
   }
 
-  private loadThread(): string | undefined {
-    try {
-      const raw = JSON.parse(readFileSync(this.notifyPath, "utf8")) as {
-        thread?: unknown;
-      };
-      return typeof raw.thread === "string" && raw.thread.trim()
-        ? raw.thread
-        : undefined;
-    } catch {
-      return undefined;
-    }
-  }
-
-  private persistThread(): void {
-    const tmp = this.notifyPath + ".tmp";
-    try {
-      writeFileSync(tmp, JSON.stringify({ thread: this.thread ?? null }));
-      renameSync(tmp, this.notifyPath);
-    } catch (e) {
-      this.log(`notify: cannot write ${this.notifyPath}: ${e instanceof Error ? e.message : e}`);
-    }
-  }
-
   private log(line: string): void {
     this.onLog?.(line);
-  }
-
-  /** Log each distinct failure once — a broken queue must not spam stderr. */
-  private logOnce(line: string): void {
-    const key = line.slice(0, 80);
-    if (this.logged.has(key)) return;
-    this.logged.add(key);
-    this.log(line);
   }
 
   private scheduleDrain(): void {
@@ -189,115 +128,19 @@ export class NotifyHub {
     }
   }
 
-  /**
-   * Route one notice. Queue delivery is fire-and-forget: a failed spawn
-   * or non-zero exit re-files the entry into the inbox so it still
-   * reaches the agent via piggyback.
-   */
+  /** Route one notice into the inbox (the only sink). */
   deliver(e: MailEntry): void {
     if (!e || typeof e.text !== "string" || !e.text) return;
-    if (!this.thread || Date.now() < this.queueRetryAt) {
-      this.pushInbox(e);
-      return;
-    }
-    const text = `[devin-subagents] ${e.name}: ${e.text}`.slice(0, MSG_CAP);
-    let p;
-    try {
-      p = spawn(
-        this.codexCommand,
-        ["queue", "--thread", this.thread, "--message", text],
-        { stdio: ["ignore", "ignore", "pipe"] },
-      );
-    } catch (err) {
-      this.failQueue(e, `codex queue spawn: ${err instanceof Error ? err.message : err}`);
-      return;
-    }
-    let errBuf = "";
-    let settled = false;
-    const fail = (msg: string) => {
-      if (settled) return;
-      settled = true;
-      this.failQueue(e, msg);
-    };
-    p.stderr?.on("data", (d) => (errBuf += d));
-    p.on("error", (err) => fail(`codex queue spawn: ${err.message}`));
-    p.on("close", (code) => {
-      if (settled) return;
-      settled = true;
-      if (code === 0) {
-        this.delivered++;
-      } else {
-        this.failQueue(
-          e,
-          `codex queue exited ${code}: ${errBuf.trim().slice(0, 200)}`,
-        );
-      }
-    });
-  }
-
-  private failQueue(e: MailEntry, msg: string): void {
-    this.logOnce(`notify: ${msg}`);
-    this.queueRetryAt = Date.now() + QUEUE_RETRY_MS;
-    this.pushInbox(e);
-  }
-
-  private pushInbox(e: MailEntry): void {
     this.inbox.push(e);
     if (this.inbox.length > INBOX_CAP) {
       this.inbox.splice(0, this.inbox.length - INBOX_CAP);
     }
   }
 
-  /** Entries not (yet) delivered via queue; consumes them for piggyback. */
+  /** Pending notices; consumes them for piggyback on tool results. */
   drainInbox(): MailEntry[] {
     this.drainMailbox();
     return this.inbox.splice(0);
-  }
-
-  register(thread: string): Record<string, unknown> {
-    const t = thread.trim();
-    if (!t) throw new Error("thread must be a non-empty string");
-    this.thread = t;
-    this.mode = "manual";
-    this.queueRetryAt = 0;
-    this.persistThread();
-    // A thread just arrived: push anything that piled up in the inbox.
-    for (const e of this.inbox.splice(0)) this.deliver(e);
-    this.drainMailbox();
-    return this.status();
-  }
-
-  /**
-   * Learn the parent thread from tool-call metadata — harnesses that tag
-   * calls (e.g. Codex's `_meta.x-codex-turn-metadata.thread_id`) get queue
-   * delivery for free, no notify() call needed. Never overrides a manual
-   * registration or an explicit off; never persisted (the id is
-   * session-scoped, not setup-scoped).
-   */
-  autoRegister(thread: string): void {
-    const t = thread.trim();
-    if (!t || (this.mode !== "none" && this.mode !== "auto")) return;
-    this.thread = t;
-    this.mode = "auto";
-    for (const e of this.inbox.splice(0)) this.deliver(e);
-    this.drainMailbox();
-  }
-
-  unregister(): Record<string, unknown> {
-    this.thread = undefined;
-    this.mode = "off";
-    this.persistThread();
-    return this.status();
-  }
-
-  status(): Record<string, unknown> {
-    return {
-      thread: this.thread ?? null,
-      mode: this.mode,
-      delivered: this.delivered,
-      inbox: this.inbox.length,
-      mailbox: this.mailboxPath,
-    };
   }
 
   close(): void {

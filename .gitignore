@@ -1,5 +1,6 @@
 node_modules/
 dist/
 .devin-subagents.json
+.devin-subagents.json.*
 devin-subagents.config.json
 *.log

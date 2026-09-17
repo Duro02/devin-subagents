@@ -8,7 +8,6 @@
   "rpcTimeoutMs": 30000,
   "bufferCap": 500,
   "hideFromSessionList": true,
-  "codexCommand": "codex",
   "reportTool": true,
   "autoNotify": true,
   "reportHint": true

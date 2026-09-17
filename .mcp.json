@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "devin": {
+      "cwd": ".",
+      "command": "node",
+      "args": [
+        "./dist/index.js"
+      ],
+      "enabled": true,
+      "startup_timeout_sec": 30
+    }
+  }
+}

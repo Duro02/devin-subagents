@@ -388,6 +388,29 @@ function emitAndFinish(sessionId, text, finish) {
 }
 
 const rl = createInterface({ input: process.stdin, terminal: false });
+
+// --- explicit lifecycle ---
+// An open stdin pipe alone does not reliably keep the event loop alive on
+// every supported Node version (observed on v26: the process can exit 0
+// while the parent still holds the pipes open, which marks every managed
+// session "dead" mid-test). This ref'd keep-alive guarantees the fake agent
+// survives until stdin ends/closes (bridge exit or test teardown) or it is
+// killed — and it is cleared on close so no timer lingers afterwards.
+const keepAlive = setInterval(() => {}, 1 << 30);
+let shuttingDown = false;
+const shutdown = () => {
+  if (shuttingDown) return;
+  shuttingDown = true;
+  clearInterval(keepAlive);
+  rl.close();
+  // stdin is gone — nobody can read further replies, so pending turn
+  // timers are pointless; exit promptly and leave no handle behind.
+  setTimeout(() => process.exit(0), 25);
+};
+process.stdin.on("end", shutdown);
+process.stdin.on("close", shutdown);
+rl.on("close", shutdown);
+
 rl.on("line", (line) => {
   let msg;
   try {

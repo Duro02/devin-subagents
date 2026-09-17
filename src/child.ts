@@ -1,9 +1,8 @@
 // Per-session MCP server injected into subagent sessions via
 // session/new|session/load mcpServers. It gives the Devin subagent one
 // tool — `report(message)` — which appends the message to the bridge's
-// mailbox file. The bridge process drains the mailbox and delivers each
-// message to the parent agent (codex queue, or piggybacked on the next
-// tool result when no thread is registered).
+// mailbox file. The bridge process drains the mailbox into its inbox,
+// which piggybacks on the parent's next tool result.
 //
 // This file is a standalone entry point: the bridge spawns it as
 //   node <dist>/child.js --name <subagent> --mailbox <path>

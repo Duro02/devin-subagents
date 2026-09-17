@@ -46,8 +46,21 @@ export interface SubSession {
     toolCall: Json;
     options: { optionId: string; name: string; kind: string }[];
   };
+  /**
+   * report() events awaiting delivery to a wait() call, oldest first.
+   * Kept separately from `events` so delivery is independent of ring-buffer
+   * eviction and of any caller's read cursor. Entries with
+   * seq <= reportDeliveredSeq are already consumed; the array is bounded
+   * (delivered entries are dropped first when trimming).
+   */
+  reportLog: { seq: number; data: Json }[];
+  /** highest report seq already returned by a wait() call */
+  reportDeliveredSeq: number;
   waiters: Set<() => void>; // waiting poll callers to wake on change
 }
+
+/** cap on buffered report() notices pending delivery to wait() */
+const REPORT_LOG_CAP = 64;
 
 interface StateFile {
   sessions: Record<
@@ -119,6 +132,8 @@ export class Registry {
       activeTurn: 0,
       queue: [],
       configuring: false,
+      reportLog: [],
+      reportDeliveredSeq: 0,
       waiters: new Set(),
     };
     this.sessions.set(name, s);
@@ -179,6 +194,22 @@ export class Registry {
     s.events.push({ seq: s.head, at, kind, data });
     if (s.events.length > this.bufferCap) {
       s.events.splice(0, s.events.length - this.bufferCap);
+    }
+    if (kind === "report") {
+      s.reportLog.push({ seq: s.head, data });
+      if (s.reportLog.length > REPORT_LOG_CAP) {
+        let excess = s.reportLog.length - REPORT_LOG_CAP;
+        // drop already-delivered entries first; then, if still over, the
+        // oldest undelivered ones (their data is still in `events` anyway)
+        s.reportLog = s.reportLog.filter((r) => {
+          if (excess > 0 && r.seq <= s.reportDeliveredSeq) {
+            excess--;
+            return false;
+          }
+          return true;
+        });
+        if (excess > 0) s.reportLog.splice(0, excess);
+      }
     }
     // the inspect snapshot tracks every event — it must not depend on the
     // ring buffer (eviction) or on any caller's read cursor (consumption)
@@ -244,22 +275,29 @@ export class Registry {
   /**
    * Wait until a new event arrives for `name` or `ms` elapses.
    * Any number of polls may wait concurrently; each is woken independently.
-   * Resolves false on timeout, true if woken by an event.
+   * An optional AbortSignal ends the wait early (resolves false) — it only
+   * abandons this waiter, never the session or the turn behind it.
+   * Resolves false on timeout/abort, true if woken by an event.
    */
-  waitForEvent(name: string, ms: number): Promise<boolean> {
+  waitForEvent(
+    name: string,
+    ms: number,
+    signal?: AbortSignal,
+  ): Promise<boolean> {
     const s = this.sessions.get(name);
-    if (!s || ms <= 0) return Promise.resolve(false);
+    if (!s || ms <= 0 || signal?.aborted) return Promise.resolve(false);
     return new Promise((resolve) => {
-      const cb = () => {
+      const settle = (woken: boolean) => {
         clearTimeout(timer);
         s.waiters.delete(cb);
-        resolve(true);
+        signal?.removeEventListener("abort", onAbort);
+        resolve(woken);
       };
-      const timer = setTimeout(() => {
-        s.waiters.delete(cb);
-        resolve(false);
-      }, ms);
+      const cb = () => settle(true);
+      const onAbort = () => settle(false);
+      const timer = setTimeout(() => settle(false), ms);
       s.waiters.add(cb);
+      signal?.addEventListener("abort", onAbort, { once: true });
     });
   }
 

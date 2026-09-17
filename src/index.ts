@@ -1,6 +1,6 @@
+#!/usr/bin/env node
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import { InMemoryTaskStore } from "@modelcontextprotocol/sdk/experimental/tasks/stores/in-memory.js";
 import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import {
@@ -9,6 +9,7 @@ import {
   type ControllerConfig,
 } from "./controller.js";
 import { loadBridgeConfig, USAGE } from "./config.js";
+import { BridgeTaskStore, runTaskWorker } from "./tasks.js";
 
 function loadConfig(): ControllerConfig {
   const { config, file, specified, help } = loadBridgeConfig(
@@ -46,29 +47,11 @@ const fail = (e: unknown) => ({
     { type: "text" as const, text: e instanceof Error ? e.message : String(e) },
   ],
 });
-/**
- * Harnesses that tag tool calls with their session identity (Codex sends
- * `_meta["x-codex-turn-metadata"].thread_id`) get queue delivery for free:
- * the first tagged call auto-registers the thread — no notify() needed.
- */
-const captureThread = (meta?: Record<string, unknown>): void => {
-  const tm = meta?.["x-codex-turn-metadata"];
-  const tid =
-    tm !== null && typeof tm === "object"
-      ? (tm as Record<string, unknown>).thread_id
-      : undefined;
-  if (typeof tid === "string" && tid.trim()) ctl.autoNotify(tid);
-};
-
-const run = async (
-  f: () => Promise<unknown> | unknown,
-  extra?: { _meta?: Record<string, unknown> },
-) => {
+const run = async (f: () => Promise<unknown> | unknown) => {
   try {
-    captureThread(extra?._meta);
     let v = await f();
-    // Undelivered subagent notices ride along on every tool result so a
-    // report() never sits unread just because no queue thread is set.
+    // Pending subagent notices ride along on every tool result so a
+    // report() never sits unread just because no one asked.
     const inbox = ctl.notifyInbox();
     if (inbox.length) {
       v =
@@ -86,6 +69,17 @@ const nameParam = z
   .string()
   .describe("Subagent handle returned by spawn, e.g. 'coder-auth'");
 
+/**
+ * How long a finished task's result is retained when the caller didn't ask
+ * for a ttl. Bounds memory for the internal tasks the SDK creates behind
+ * plain (non-task) wait calls; clients requesting a ttl get it verbatim.
+ */
+const TASK_RESULT_TTL_MS = 600_000;
+
+const taskStore = new BridgeTaskStore({
+  onLog: (l) => process.stderr.write(`[devin] ${l}\n`),
+});
+
 const server = new McpServer(
   {
     name: "devin-subagents",
@@ -96,7 +90,7 @@ const server = new McpServer(
     // tools (wait) can run as real background tasks whose result is
     // delivered natively. Older clients just see normal tools.
     capabilities: { tasks: { requests: { tools: { call: {} } } } },
-    taskStore: new InMemoryTaskStore(),
+    taskStore,
   },
 );
 
@@ -128,8 +122,8 @@ server.registerTool(
         .describe("Model to confirm (e.g. 'swe-2-max'); default: config file 'model' or 'swe-2-max'"),
     },
   },
-  ({ name, task, cwd, mode, model }, extra) =>
-    run(() => ctl.spawn(name, task, cwd, mode, model), extra),
+  ({ name, task, cwd, mode, model }) =>
+    run(() => ctl.spawn(name, task, cwd, mode, model)),
 );
 
 server.registerTool(
@@ -146,7 +140,7 @@ server.registerTool(
       text: z.string().min(1).describe("Message text"),
     },
   },
-  ({ name, text }, extra) => run(() => ctl.send(name, text), extra),
+  ({ name, text }) => run(() => ctl.send(name, text)),
 );
 
 server.registerTool(
@@ -200,10 +194,9 @@ server.registerTool(
         .describe("logs only: max buffered events consumed this call; page via nextCursor/hasMore"),
     },
   },
-  ({ name, wait_ms, since, detail, limit }, extra) =>
-    run(
-      () => ctl.poll(name, wait_ms ?? 0, since, detail ?? "inspect", limit),
-      extra,
+  ({ name, wait_ms, since, detail, limit }) =>
+    run(() =>
+      ctl.poll(name, wait_ms ?? 0, since, detail ?? "inspect", limit),
     ),
 );
 
@@ -219,7 +212,8 @@ server.experimental.tasks.registerToolTask(
       "Block until the subagent needs you, then return what happened. " +
       "Wakes on: turn drained to idle (wake='done'), a pending permission " +
       "request (wake='permission' — answer via the permission tool), a " +
-      "report() checkpoint from the subagent (wake='report'), terminal " +
+      "report() checkpoint from the subagent (wake='report' — a report is " +
+      "delivered once, even if it arrived before this call), terminal " +
       "states (wake='stopped'/'dead'), or timeout (wake='timeout', " +
       "snapshot shows live state). Already-attention states return " +
       "immediately, so it doubles as 'is it done?'. On hosts supporting " +
@@ -240,31 +234,43 @@ server.experimental.tasks.registerToolTask(
   },
   {
     createTask: async ({ name, timeout_ms }, extra) => {
-      captureThread(extra._meta as Record<string, unknown> | undefined);
       const task = await extra.taskStore!.createTask({
-        ttl: extra.taskRequestedTtl ?? null,
+        ttl: extra.taskRequestedTtl ?? TASK_RESULT_TTL_MS,
         pollInterval: 500,
       });
-      void (async () => {
-        try {
-          let v: unknown = await ctl.wait(name, timeout_ms ?? WAIT_DEFAULT_MS);
+      // Two cancellation sources converge on the same AbortController:
+      // tasks/cancel aborts it inside the store; for plain (non-task) calls
+      // the harness cancels the request itself — link extra.signal so that
+      // path ends the waiter too. Neither ever touches the Devin turn.
+      const signal = taskStore.aborter(task.taskId);
+      if (extra.signal.aborted) {
+        taskStore.abortTask(task.taskId);
+      } else {
+        extra.signal.addEventListener(
+          "abort",
+          () => taskStore.abortTask(task.taskId),
+          { once: true },
+        );
+      }
+      runTaskWorker({
+        store: extra.taskStore!,
+        taskId: task.taskId,
+        work: async () => {
+          let v: unknown = await ctl.wait(
+            name,
+            timeout_ms ?? WAIT_DEFAULT_MS,
+            signal,
+          );
           const inbox = ctl.notifyInbox();
           if (inbox.length) {
             v = { ...(v as Record<string, unknown>), inbox };
           }
-          await extra.taskStore!.storeTaskResult(
-            task.taskId,
-            "completed",
-            ok(v),
-          );
-        } catch (e) {
-          await extra.taskStore!.storeTaskResult(
-            task.taskId,
-            "failed",
-            fail(e),
-          );
-        }
-      })();
+          return v;
+        },
+        ok,
+        fail,
+        onLog: (l) => process.stderr.write(`[devin] ${l}\n`),
+      });
       return { task };
     },
     getTask: async (_args, { taskId, taskStore }) => {
@@ -286,7 +292,7 @@ server.registerTool(
       "The session stays alive and resumable.",
     inputSchema: { name: nameParam },
   },
-  ({ name }, extra) => run(() => ctl.interrupt(name), extra),
+  ({ name }) => run(() => ctl.interrupt(name)),
 );
 
 server.registerTool(
@@ -298,7 +304,7 @@ server.registerTool(
       "stopped. The session is kept and can be continued later with resume.",
     inputSchema: { name: nameParam },
   },
-  ({ name }, extra) => run(() => ctl.stop(name), extra),
+  ({ name }) => run(() => ctl.stop(name)),
 );
 
 server.registerTool(
@@ -310,36 +316,7 @@ server.registerTool(
       "restarts). Safe no-op on already-running subagents.",
     inputSchema: { name: nameParam },
   },
-  ({ name }, extra) => run(() => ctl.resume(name), extra),
-);
-
-server.registerTool(
-  "notify",
-  {
-    title: "Register a Codex thread for subagent notices",
-    description:
-      "Point subagent notices at a Codex session. Usually automatic: " +
-      "hosts that tag tool calls with their thread id (Codex's " +
-      "x-codex-turn-metadata) are registered on first use. Once a thread " +
-      "is known, turn completions, permission requests and subagent " +
-      "report() calls are pushed into that session via `codex queue` " +
-      "(they arrive as queued messages — no polling needed). Without a " +
-      "thread, notices ride along on tool results as `inbox` instead. " +
-      "Pass a thread (session UUID or exact session name) to override the " +
-      "auto-detected one, no args for status, off:true to unregister.",
-    inputSchema: {
-      thread: z
-        .string()
-        .min(1)
-        .optional()
-        .describe("Codex session UUID or exact session name to notify"),
-      off: z
-        .boolean()
-        .optional()
-        .describe("true: unregister and stop queue delivery"),
-    },
-  },
-  ({ thread, off }, extra) => run(() => ctl.notify(thread, off), extra),
+  ({ name }) => run(() => ctl.resume(name)),
 );
 
 server.registerTool(
@@ -349,7 +326,7 @@ server.registerTool(
     description: "List live, persisted, and agent-side sessions with status.",
     inputSchema: {},
   },
-  (_args, extra) => run(() => ctl.list(), extra),
+  () => run(() => ctl.list()),
 );
 
 server.registerTool(
@@ -368,8 +345,7 @@ server.registerTool(
         .describe("The optionId from pendingPermission.options to select"),
     },
   },
-  ({ name, optionId }, extra) =>
-    run(() => ctl.permission(name, optionId), extra),
+  ({ name, optionId }) => run(() => ctl.permission(name, optionId)),
 );
 
 server.registerTool(
@@ -384,7 +360,7 @@ server.registerTool(
       mode: z.string().min(1).describe("Mode id from the session's availableModes"),
     },
   },
-  ({ name, mode }, extra) => run(() => ctl.setMode(name, mode), extra),
+  ({ name, mode }) => run(() => ctl.setMode(name, mode)),
 );
 
 server.registerTool(
@@ -400,7 +376,7 @@ server.registerTool(
       name: nameParam.optional(),
     },
   },
-  ({ name }, extra) => run(() => ctl.models(name), extra),
+  ({ name }) => run(() => ctl.models(name)),
 );
 
 server.registerTool(
@@ -417,19 +393,20 @@ server.registerTool(
       model: z.string().min(1).describe("Model id from the session's advertised list"),
     },
   },
-  ({ name, model }, extra) => run(() => ctl.setModel(name, model), extra),
+  ({ name, model }) => run(() => ctl.setModel(name, model)),
 );
 
 async function main(): Promise<void> {
   cfg = loadConfig();
   ctl = new Controller(cfg);
   const shutdown = () => {
+    taskStore.cleanup();
     ctl.close();
     process.exit(0);
   };
   process.on("SIGINT", shutdown);
   process.on("SIGTERM", shutdown);
-  // Codex closed our stdin (session over): take the devin child with us.
+  // The host closed our stdin (session over): take the devin child with us.
   process.stdin.on("end", shutdown);
 
   await server.connect(new StdioServerTransport());

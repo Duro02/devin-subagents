@@ -2,12 +2,23 @@
   "name": "devin-subagents",
   "version": "0.5.0",
   "description": "Expose `devin acp` sessions as lifecycle-managed subagents over MCP (spawn / poll / send / interrupt / resume).",
+  "repository": "github:Duro02/devin-subagents",
+  "license": "MIT",
+  "keywords": ["mcp", "devin", "acp", "subagent", "agent"],
   "type": "module",
   "bin": {
     "devin-subagents": "dist/index.js"
   },
+  "files": [
+    ".mcp.json",
+    "dist/",
+    "skills/",
+    "README.md",
+    "devin-subagents.config.example.json"
+  ],
   "scripts": {
     "build": "tsc",
+    "prepack": "npm run build",
     "start": "node dist/index.js",
     "smoke": "npm run build && node scripts/handshake.mjs",
     "test": "npm run build && node --test \"test/*.test.mjs\"",

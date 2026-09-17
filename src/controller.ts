@@ -45,10 +45,6 @@ export interface ControllerConfig {
   hideFromSessionList: boolean;
   /** devin session DB override; default = platform data dir path */
   sessionDbPath?: string;
-  /** codex thread receiving notices via `codex queue` (see notify tool) */
-  notifyThread?: string;
-  /** codex binary for queue delivery (default "codex") */
-  codexCommand?: string;
   /** inject the `report` MCP tool into subagent sessions (default true) */
   reportTool?: boolean;
   /** bridge-side notices on turn_end / permission_request (default true) */
@@ -62,7 +58,7 @@ const NAME_RE = /^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$/;
 const ID_RE = /^[^\s\\]{1,128}$/;
 const MAX_TEXT = 256_000;
 const QUEUE_CAP = 32;
-/** wait() hard ceiling — matches common host tool timeouts (codex: 1h) */
+/** wait() hard ceiling — bounds a single blocking call; hosts may time out earlier */
 const WAIT_MAX_MS = 3_600_000;
 export const WAIT_DEFAULT_MS = 600_000;
 /** Sentinels accepted for mode/model: "use the agent's own default". */
@@ -125,15 +121,12 @@ export class Controller {
   private hiddenPending = new Set<string>();
   /** session ids confirmed hidden (by us or already flagged) */
   private hiddenDone = new Set<string>();
-  /** subagent-originated notices → parent session (queue / inbox) */
+  /** subagent-originated notices → parent session (inbox piggyback) */
   private hub: NotifyHub;
 
   constructor(private cfg: ControllerConfig) {
     this.hub = new NotifyHub({
       mailboxPath: `${cfg.statePath}.mailbox.jsonl`,
-      notifyPath: `${cfg.statePath}.notify.json`,
-      codexCommand: cfg.codexCommand ?? "codex",
-      thread: cfg.notifyThread,
       // a child report() also lands in the session event log: it wakes
       // wait() and stays readable via poll(logs) — same record, three views
       onEntry: (e) => {
@@ -221,22 +214,6 @@ export class Controller {
         env: [],
       },
     ];
-  }
-
-  /** Agent-facing: register/query the codex thread receiving notices. */
-  notify(thread?: string, off?: boolean): Json {
-    if (off === true) return this.hub.unregister();
-    if (thread !== undefined) return this.hub.register(thread);
-    return this.hub.status();
-  }
-
-  /**
-   * Auto-learn the calling session's thread from tool-call metadata
-   * (`_meta.x-codex-turn-metadata.thread_id` on Codex). No-op when a
-   * manual registration or explicit off is in effect.
-   */
-  autoNotify(thread: string): void {
-    this.hub.autoRegister(thread);
   }
 
   /** Undelivered notices, consumed to piggyback on tool results. */
@@ -749,49 +726,71 @@ export class Controller {
    * Block until the subagent needs attention or `timeoutMs` elapses.
    *
    * Wake reasons (returned as `wake`):
-   *  - "done":       turn drained to idle — the unit of work finished
+   *  - "done":       turn drained to idle — `output` carries the finished
+   *                  turn's full text (the deliverable; truncated>64k flags)
    *  - "permission": operator-mode request is pending approval
-   *  - "report":     the subagent called report() after this wait began
+   *  - "report":     an unacknowledged report() checkpoint exists
    *  - "stopped"/"dead": terminal lifecycle states
    *  - "timeout":    still working; the snapshot shows what it's doing
+   *  - "cancelled":  `signal` aborted — the waiter stopped; the Devin turn
+   *                  behind it is untouched
+   *
+   * Report delivery is an unacknowledged queue, not a per-call baseline:
+   * a report that arrived before this wait began is still returned once —
+   * then `reportDeliveredSeq` advances so the same report never repeats in
+   * later unrelated waits. Each blocked wait keeps its own delivery cursor,
+   * so every waiter already parked when a report lands observes it (first
+   * come, all served); a wait started afterwards does not see it again.
    *
    * A state already needing attention at call time returns immediately —
    * wait() on an idle subagent answers "is it done?" with no delay.
    */
-  async wait(name: string, timeoutMs = WAIT_DEFAULT_MS): Promise<Json> {
+  async wait(
+    name: string,
+    timeoutMs = WAIT_DEFAULT_MS,
+    signal?: AbortSignal,
+  ): Promise<Json> {
     const s = this.require(name);
     this.flushHidden();
     const started = Date.now();
     const deadline = started + Math.max(0, Math.min(timeoutMs, WAIT_MAX_MS));
-    const baseline = s.head;
+    let delivered = s.reportDeliveredSeq; // per-call delivery cursor
     const attention = (cur: SubSession): Json | undefined => {
       if (cur.pendingPermission) {
         return { wake: "permission", permission: cur.pendingPermission };
       }
-      for (let i = cur.events.length - 1; i >= 0; i--) {
-        const e = cur.events[i];
-        if (e.seq <= baseline) break;
-        if (e.kind === "report") return { wake: "report", report: e.data };
+      const rep = cur.reportLog.find((r) => r.seq > delivered);
+      if (rep) {
+        delivered = rep.seq;
+        if (rep.seq > cur.reportDeliveredSeq) cur.reportDeliveredSeq = rep.seq;
+        return { wake: "report", report: rep.data };
       }
       if (cur.status === "dead") return { wake: "dead" };
       if (cur.status === "stopped") return { wake: "stopped" };
       if (cur.status === "idle" && cur.activeTurn === 0 && !cur.queue.length) {
-        return { wake: "done", lastStopReason: cur.lastStopReason ?? null };
+        return {
+          wake: "done",
+          lastStopReason: cur.lastStopReason ?? null,
+          // the finished turn's full text — the subagent's deliverable,
+          // no follow-up poll needed just to read the result
+          ...(cur.obs.turnText ? { output: cur.obs.turnText } : {}),
+        };
       }
       return undefined;
     };
     let cur = this.registry.get(name) ?? s;
-    let hit = attention(cur);
-    while (!hit && Date.now() < deadline) {
-      await this.registry.waitForEvent(name, deadline - Date.now());
+    // an already-aborted caller never even looks at attention state
+    let hit = signal?.aborted ? undefined : attention(cur);
+    while (!hit && !signal?.aborted && Date.now() < deadline) {
+      await this.registry.waitForEvent(name, deadline - Date.now(), signal);
       cur = this.registry.get(name) ?? cur; // released mid-wait: last view
-      hit = attention(cur);
+      hit = signal?.aborted ? undefined : attention(cur);
     }
     const now = Date.now();
     return {
       name,
       status: cur.status,
-      ...(hit ?? { wake: "timeout" }),
+      ...(hit ?? { wake: signal?.aborted ? "cancelled" : "timeout" }),
       waitedMs: now - started,
       cursor: cur.head,
       snapshot: buildSnapshot(cur.obs, now),

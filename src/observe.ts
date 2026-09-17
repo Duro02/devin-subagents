@@ -48,6 +48,12 @@ export interface Observation {
   };
   /** current/latest turn's accumulated agent_message text (bounded tail) */
   latestText?: { text: string; at: string; turn: number };
+  /**
+   * same accumulation as latestText but kept to TURN_TEXT — the turn's
+   * "deliverable" text, surfaced on wait()'s done result. Resets on
+   * turn_start like latestText.
+   */
+  turnText?: { text: string; truncated: boolean; at: string; turn: number };
   lastError?: { message: string; at: string; turn: number };
   /** latest plan update's entries, kept whole for current-step lookup */
   plan?: { entries: Json[]; at: string; turn: number };
@@ -116,6 +122,8 @@ const CLOSED_TOOLS_CAP = 256;
 const OUTPUT_TEXT = 300;
 const ERROR_TEXT = 500;
 const LATEST_TEXT = 4000;
+/** per-turn deliverable text kept for wait()'s done output */
+const TURN_TEXT = 64_000;
 
 const tail = (s: string, n: number) =>
   s.length > n ? `…${s.slice(-n)}` : s;
@@ -212,6 +220,14 @@ export function recordObservation(
         prev && prev.turn === curTurn
           ? { text: tail(prev.text + text, LATEST_TEXT), at, turn: curTurn }
           : { text: tail(text, LATEST_TEXT), at, turn: curTurn };
+      const tp = obs.turnText;
+      const joined = tp && tp.turn === curTurn ? tp.text + text : text;
+      obs.turnText = {
+        text: tail(joined, TURN_TEXT),
+        truncated: (tp?.truncated ?? false) || joined.length > TURN_TEXT,
+        at,
+        turn: curTurn,
+      };
       break;
     }
     case "agent_thought_chunk":
@@ -274,6 +290,7 @@ export function recordObservation(
       obs.turnEndedAt = undefined;
       obs.turnStopReason = undefined;
       obs.latestText = undefined; // per-turn accumulated text
+      obs.turnText = undefined;
       break;
     }
     case "turn_end": {

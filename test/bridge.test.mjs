@@ -8,7 +8,6 @@ import {
   writeFileSync,
   readFileSync,
   existsSync,
-  chmodSync,
   appendFileSync,
 } from "node:fs";
 import { tmpdir } from "node:os";
@@ -47,8 +46,6 @@ function makeCtl(t, opts = {}) {
     bufferCap: opts.bufferCap,
     hideFromSessionList: opts.hideFromSessionList ?? false,
     sessionDbPath: opts.sessionDbPath,
-    notifyThread: opts.notifyThread,
-    codexCommand: opts.codexCommand,
     reportTool: opts.reportTool,
     autoNotify: opts.autoNotify,
     reportHint: opts.reportHint,
@@ -590,7 +587,6 @@ test("config: defaults when no file; cwd default file picked up", async (t) => {
     rpcTimeoutMs: 30000,
     bufferCap: 500,
     hideFromSessionList: true,
-    codexCommand: "codex",
     reportTool: true,
     autoNotify: true,
     reportHint: true,
@@ -1355,37 +1351,13 @@ test("config: hideFromSessionList/sessionDbPath parsing", async (t) => {
 
 const CHILD = fileURLToPath(new URL("../dist/child.js", import.meta.url));
 
-/** A fake `codex` binary: logs its argv (one arg per line) to a file. */
-function codexStub(t) {
-  const dir = mkdtempSync(path.join(tmpdir(), "subagents-codex-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const log = path.join(dir, "args.log");
-  const stub = path.join(dir, "codex-stub.sh");
-  writeFileSync(stub, `#!/bin/sh\nprintf '%s\\n' "$@" >> "${log}"\n`);
-  chmodSync(stub, 0o755);
-  return { stub, log };
-}
-
 const readLines = (p) =>
   existsSync(p) ? readFileSync(p, "utf8").split("\n").filter(Boolean) : [];
-
-async function untilFile(p, ms = 4000) {
-  const end = Date.now() + ms;
-  for (;;) {
-    if (existsSync(p) && readFileSync(p, "utf8").trim()) {
-      return readFileSync(p, "utf8");
-    }
-    if (Date.now() > end) throw new Error(`timeout waiting for ${p}`);
-    await sleep(20);
-  }
-}
 
 function makeHub(t, dir, opts = {}) {
   const hub = new NotifyHub({
     mailboxPath: path.join(dir, "mailbox.jsonl"),
-    notifyPath: path.join(dir, "notify.json"),
-    codexCommand: opts.codexCommand ?? "definitely-not-codex",
-    thread: opts.thread,
+    onEntry: opts.onEntry,
     onLog: () => {},
   });
   t.after(() => hub.close());
@@ -1444,74 +1416,52 @@ test("child: report tool call lands in the mailbox", async (t) => {
   assert.equal(lines[0].text, "checkpoint one");
 });
 
-test("notify: no thread -> inbox; register flushes via codex queue", async (t) => {
+test("notify: deliver() lands in the inbox; drainInbox consumes", async (t) => {
   const dir = mkdtempSync(path.join(tmpdir(), "subagents-notify-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const { stub, log } = codexStub(t);
-  const hub = makeHub(t, dir, { codexCommand: stub });
+  const hub = makeHub(t, dir);
 
   hub.deliver({ name: "a", at: 1, text: "hello parent" });
-  assert.equal(hub.status().inbox, 1);
-
-  hub.register("thread-9");
-  const out = await untilFile(log);
-  assert.match(out, /queue/);
-  assert.match(out, /--thread/);
-  assert.match(out, /thread-9/);
-  assert.match(out, /\[devin-subagents\] a: hello parent/);
-  assert.equal(hub.status().delivered, 1);
-  assert.equal(hub.status().inbox, 0);
-  // thread persisted for a bridge restart
-  assert.match(readFileSync(path.join(dir, "notify.json"), "utf8"), /thread-9/);
-  assert.equal(hub.unregister().thread, null);
+  hub.deliver({ name: "a", at: 2, text: "second" });
+  const inbox = hub.drainInbox();
+  assert.equal(inbox.length, 2);
+  assert.equal(inbox[0].text, "hello parent");
+  assert.equal(inbox[1].text, "second");
+  assert.equal(hub.drainInbox().length, 0); // consumed
 });
 
-test("notify: mailbox lines are drained and delivered", async (t) => {
+test("notify: mailbox lines are drained into the inbox, onEntry fires", async (t) => {
   const dir = mkdtempSync(path.join(tmpdir(), "subagents-notify-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const { stub, log } = codexStub(t);
-  const hub = makeHub(t, dir, { codexCommand: stub, thread: "thread-7" });
+  const seen = [];
+  const hub = makeHub(t, dir, { onEntry: (e) => seen.push(e) });
   const mailbox = path.join(dir, "mailbox.jsonl");
   appendFileSync(
     mailbox,
     JSON.stringify({ name: "kid", at: 2, text: "from child" }) + "\n",
   );
   hub.drainMailbox();
-  const out = await untilFile(log);
-  assert.match(out, /\[devin-subagents\] kid: from child/);
+  const inbox = hub.drainInbox();
+  assert.equal(inbox.length, 1);
+  assert.equal(inbox[0].text, "from child");
+  assert.equal(seen.length, 1);
+  assert.equal(seen[0].name, "kid");
   // idempotent: a second drain does not redeliver
   hub.drainMailbox();
-  await sleep(100);
-  assert.equal(hub.status().delivered, 1);
+  assert.equal(hub.drainInbox().length, 0);
 });
 
-test("notify: queue failure falls back to inbox, retried on register", async (t) => {
-  const dir = mkdtempSync(path.join(tmpdir(), "subagents-notify-"));
-  t.after(() => rmSync(dir, { recursive: true, force: true }));
-  const failStub = path.join(dir, "fail.sh");
-  writeFileSync(failStub, "#!/bin/sh\nexit 1\n");
-  chmodSync(failStub, 0o755);
-  const hub = makeHub(t, dir, { codexCommand: failStub, thread: "t-x" });
-  hub.deliver({ name: "a", at: 1, text: "lost?" });
-  const end = Date.now() + 3000;
-  while (hub.status().inbox < 1 && Date.now() < end) await sleep(20);
-  assert.equal(hub.drainInbox()[0].text, "lost?");
-});
-
-test("wiring: spawn injects report MCP + hint; turn_end hits codex queue", async (t) => {
-  const { stub, log } = codexStub(t);
+test("wiring: spawn injects report MCP + hint; turn_end lands in inbox", async (t) => {
   const { ctl, dir } = makeCtl(t, {
-    codexCommand: stub,
-    notifyThread: "thread-42",
     env: (d) => ({ FAKE_ACP_PARAM_LOG: path.join(d, "params.jsonl") }),
   });
   await ctl.spawn("w", "do it");
   await untilDone(ctl, "w");
 
-  const out = await untilFile(log);
-  assert.match(out, /--thread/);
-  assert.match(out, /thread-42/);
-  assert.match(out, /\[devin-subagents\] w: turn 1 ended \(end_turn\)/);
+  const inbox = ctl.notifyInbox();
+  assert.equal(inbox.length, 1);
+  assert.equal(inbox[0].name, "w");
+  assert.match(inbox[0].text, /turn 1 ended \(end_turn\)/);
 
   const params = readLines(path.join(dir, "params.jsonl")).map((l) =>
     JSON.parse(l),
@@ -1547,23 +1497,19 @@ test("reportTool off: no mcpServers injected and no hint", async (t) => {
   await untilDone(ctl, "x");
 });
 
-test("autoNotify: operator-mode permission_request reaches the queue", async (t) => {
-  const { stub, log } = codexStub(t);
-  const { ctl } = makeCtl(t, {
-    policy: "operator",
-    codexCommand: stub,
-    notifyThread: "th-1",
-  });
+test("autoNotify: operator-mode permission_request reaches the inbox", async (t) => {
+  const { ctl } = makeCtl(t, { policy: "operator" });
   await ctl.spawn("p", "[[perm]]");
   await untilEvent(ctl, "p", "permission_request");
-  const out = await untilFile(log);
-  assert.match(out, /requests permission: Run dangerous command/);
+  const inbox = ctl.notifyInbox();
+  assert.equal(inbox.length, 1);
+  assert.match(inbox[0].text, /requests permission: Run dangerous command/);
   ctl.permission("p", "allow_once");
   await untilDone(ctl, "p");
 });
 
 test("inbox: undelivered notices surface via notifyInbox()", async (t) => {
-  const { ctl, dir } = makeCtl(t); // no thread registered
+  const { ctl, dir } = makeCtl(t);
   appendFileSync(
     `${dir}/state.json.mailbox.jsonl`,
     JSON.stringify({ name: "k", at: 1, text: "hi parent" }) + "\n",
@@ -1575,43 +1521,24 @@ test("inbox: undelivered notices surface via notifyInbox()", async (t) => {
   assert.equal(ctl.notifyInbox().length, 0); // consumed
 });
 
-test("notify tool: register/status/unregister via controller", async (t) => {
-  const { stub, log } = codexStub(t);
-  const { ctl, dir } = makeCtl(t, { codexCommand: stub });
-  assert.equal(ctl.notify().thread, null);
-  const st = ctl.notify("thread-live");
-  assert.equal(st.thread, "thread-live");
-  assert.match(
-    readFileSync(`${dir}/state.json.notify.json`, "utf8"),
-    /thread-live/,
-  );
-  assert.equal(ctl.notify(undefined, true).thread, null);
-});
-
-test("config: notify/report keys parse with defaults and validation", async (t) => {
+test("config: report keys parse with defaults and validation", async (t) => {
   const dir = mkdtempSync(path.join(tmpdir(), "subagents-cfg-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
 
   const def = loadBridgeConfig([], dir); // no config file
-  assert.equal(def.config.codexCommand, "codex");
   assert.equal(def.config.reportTool, true);
   assert.equal(def.config.autoNotify, true);
   assert.equal(def.config.reportHint, true);
-  assert.equal(def.config.notifyThread, undefined);
 
   writeFileSync(
     path.join(dir, "c.json"),
     JSON.stringify({
-      notifyThread: "abc-123",
-      codexCommand: "./cx",
       reportTool: false,
       autoNotify: false,
       reportHint: false,
     }),
   );
   const d = loadBridgeConfig(["--config", "c.json"], dir);
-  assert.equal(d.config.notifyThread, "abc-123");
-  assert.equal(d.config.codexCommand, path.join(dir, "cx")); // path → resolved
   assert.equal(d.config.reportTool, false);
   assert.equal(d.config.autoNotify, false);
   assert.equal(d.config.reportHint, false);
@@ -1622,8 +1549,9 @@ test("config: notify/report keys parse with defaults and validation", async (t) 
   };
   assert.throws(() => loadBridgeConfig(w('{"reportTool": "yes"}'), dir), /boolean/);
   assert.throws(() => loadBridgeConfig(w('{"autoNotify": 1}'), dir), /boolean/);
-  assert.throws(() => loadBridgeConfig(w('{"notifyThread": " "}'), dir), /non-empty/);
-  assert.throws(() => loadBridgeConfig(w('{"codexCommand": 5}'), dir), /non-empty/);
+  // codex-specific keys are gone — unknown keys stay rejected
+  assert.throws(() => loadBridgeConfig(w('{"notifyThread": "t"}'), dir), /unknown key/);
+  assert.throws(() => loadBridgeConfig(w('{"codexCommand": "x"}'), dir), /unknown key/);
 });
 
 // ---------- wait: block-until-attention ----------
@@ -1636,6 +1564,18 @@ test("wait: returns done when the turn drains to idle", async (t) => {
   assert.equal(r.status, "idle");
   assert.equal(r.lastStopReason, "end_turn");
   assert.ok(r.snapshot);
+});
+
+test("wait: done carries the finished turn's full text as output", async (t) => {
+  const { ctl } = makeCtl(t);
+  await ctl.spawn("wo", "[[chunks:2]] ship the report");
+  const r = await ctl.wait("wo", 5000);
+  assert.equal(r.wake, "done");
+  assert.equal(r.output.turn, 1);
+  assert.equal(r.output.truncated, false);
+  // the whole turn's message text, not just a 4k snapshot tail
+  assert.match(r.output.text, /chunk1/);
+  assert.match(r.output.text, /fake reply: ship the report/);
 });
 
 test("wait: report() checkpoint wakes the wait and lands in the log", async (t) => {
@@ -1691,34 +1631,85 @@ test("wait: already-idle subagent answers done with no delay", async (t) => {
   assert.ok(Date.now() - t0 < 500);
 });
 
-test("autoRegister: _meta thread learned; manual/off always win", async (t) => {
-  const { stub, log } = codexStub(t);
-  const { ctl, dir } = makeCtl(t, { codexCommand: stub });
-
-  ctl.autoNotify("thread-auto");
-  assert.equal(ctl.notify().thread, "thread-auto");
-  assert.equal(ctl.notify().mode, "auto");
-  // delivery flows without any notify() call
+test("wait: a report that arrived before wait is returned exactly once", async (t) => {
+  const { ctl, dir } = makeCtl(t);
+  await ctl.spawn("wr", "[[sleep:1500]]"); // stays running across the checks
+  // report lands between spawn returning and the first wait call — the old
+  // head-baseline design silently missed it
   appendFileSync(
     `${dir}/state.json.mailbox.jsonl`,
-    JSON.stringify({ name: "k", at: 1, text: "auto wired" }) + "\n",
+    JSON.stringify({ name: "wr", at: Date.now(), text: "early bird" }) + "\n",
   );
-  ctl.notifyInbox(); // forces a drain; entry goes to the queue, not inbox
-  const out = await untilFile(log);
-  assert.match(out, /--thread/);
-  assert.match(out, /thread-auto/);
-  assert.match(out, /\[devin-subagents\] k: auto wired/);
+  ctl.notifyInbox(); // drains the mailbox synchronously -> report event lands
+  const t0 = Date.now();
+  const r1 = await ctl.wait("wr", 2000);
+  assert.equal(r1.wake, "report");
+  assert.equal(r1.report.text, "early bird");
+  assert.ok(Date.now() - t0 < 500, "pre-arrived report must return at once");
+  // the same report must not repeat in a later, unrelated wait
+  const r2 = await ctl.wait("wr", 150);
+  assert.equal(r2.wake, "timeout");
+  // once the turn ends the next wait reports done — not a stale report
+  const r3 = await ctl.wait("wr", 4000);
+  assert.equal(r3.wake, "done");
+});
 
-  // a manual registration overrides the learned one
-  ctl.notify("thread-manual");
-  ctl.autoNotify("thread-other");
-  assert.equal(ctl.notify().thread, "thread-manual");
-  assert.equal(ctl.notify().mode, "manual");
+test("wait: every already-blocked waiter observes a new report", async (t) => {
+  const { ctl, dir } = makeCtl(t);
+  await ctl.spawn("wc", "[[sleep:1500]]");
+  const w1 = ctl.wait("wc", 3000);
+  const w2 = ctl.wait("wc", 3000);
+  await sleep(50); // both waits are parked now
+  appendFileSync(
+    `${dir}/state.json.mailbox.jsonl`,
+    JSON.stringify({ name: "wc", at: Date.now(), text: "broadcast" }) + "\n",
+  );
+  ctl.notifyInbox();
+  const [a, b] = await Promise.all([w1, w2]);
+  assert.equal(a.wake, "report");
+  assert.equal(b.wake, "report");
+  assert.equal(a.report.text, "broadcast");
+  assert.equal(b.report.text, "broadcast");
+  // a wait started after delivery does not see it again
+  const r = await ctl.wait("wc", 150);
+  assert.equal(r.wake, "timeout");
+  await untilDone(ctl, "wc");
+});
 
-  // explicit off sticks — auto-capture can't resurrect delivery
-  ctl.notify(undefined, true);
-  ctl.autoNotify("thread-x");
-  const st = ctl.notify();
-  assert.equal(st.thread, null);
-  assert.equal(st.mode, "off");
+test("wait: abort cancels the waiter only — the turn runs to end_turn", async (t) => {
+  const { ctl } = makeCtl(t);
+  await ctl.spawn("wa", "[[sleep:400]]");
+  const ac = new AbortController();
+  const p = ctl.wait("wa", 5000, ac.signal);
+  setTimeout(() => ac.abort(), 50);
+  const r = await p;
+  assert.equal(r.wake, "cancelled");
+  assert.equal(r.status, "running"); // still running — turn untouched
+  const d = await untilDone(ctl, "wa");
+  assert.equal(d.lastStopReason, "end_turn"); // not cancelled
+  // a pre-aborted signal returns immediately
+  const ac2 = new AbortController();
+  ac2.abort();
+  const t0 = Date.now();
+  const r2 = await ctl.wait("wa", 5000, ac2.signal);
+  assert.equal(r2.wake, "cancelled");
+  assert.ok(Date.now() - t0 < 300);
+});
+
+test("fake-acp: stays alive while stdin is open, exits 0 on close", async (t) => {
+  const child = spawn(process.execPath, [FAKE], {
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  let exited = /** @type {number | null} */ (null);
+  child.on("exit", (c) => (exited = c));
+  t.after(() => child.kill("SIGKILL"));
+  await sleep(600); // pipes open, no I/O — must still be alive
+  assert.equal(exited, null, "fake agent exited while its pipes were open");
+  child.stdin.end();
+  const code = await new Promise((r) => {
+    if (exited !== null) return r(exited);
+    child.on("exit", (c) => r(c));
+    setTimeout(() => r("timeout"), 4000);
+  });
+  assert.equal(code, 0, "stdin close must shut the fake down cleanly");
 });
