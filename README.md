@@ -27,29 +27,21 @@ MCP Host ──stdio/MCP──▶ devin-subagents ──stdio/ACP──▶ devin
 
 ### Standard Setup
 
-1. **Clone & Build**:
-   ```bash
-   git clone https://github.com/Duro02/devin-subagents.git
-   cd devin-subagents
-   npm ci && npm run build
-   ```
-
-2. **Register MCP Server**:
+1. **Register MCP Server**:
    Add to your MCP host configuration:
    ```json
    {
      "mcpServers": {
        "devin": {
-         "command": "node",
-         "args": ["/path/to/devin_subagents/dist/index.js"],
-         "cwd": "/path/to/devin_subagents"
+         "command": "npx",
+         "args": ["-y", "devin-subagents"]
        }
      }
    }
    ```
    > **Note**: The server's `cwd` determines the resolution path for `.devin-subagents.json` (state persistence) and optional `devin-subagents.config.json`. If your host cannot pin `cwd`, pass `--config /path/to/config.json` in `args` and specify an absolute `statePath` in your config.
 
-3. **Install Skill**:
+2. **Install Skill**:
    ```bash
    npx skills add Duro02/devin-subagents -g -a <harness>
    ```
@@ -62,10 +54,9 @@ Paste this prompt directly to your host agent:
 ```text
 Install devin-subagents into this harness—both the stdio MCP server and the skill. Source: https://github.com/Duro02/devin-subagents (use an existing local clone if available).
 
-1. Clone to a stable directory and run `npm ci && npm run build` inside the repository.
-2. Register a stdio MCP server named `devin` following this harness's conventions: `node <clone_dir>/dist/index.js`, pinning the server cwd to <clone_dir>.
-3. Install the skill: `npx skills add Duro02/devin-subagents -g -a <this_harness>`; if that fails, copy or symlink `skills/devin-subagents/` into its user-level skill directory.
-4. Verify the MCP server is registered and the skill is visible, then prompt me to restart or reload the harness.
+1. Register a stdio MCP server named `devin` following this harness's conventions: `npx -y devin-subagents`.
+2. Install the skill: `npx skills add Duro02/devin-subagents -g -a <this_harness>`; if that fails, copy or symlink `skills/devin-subagents/` into its user-level skill directory.
+3. Verify the MCP server is registered and the skill is visible, then prompt me to restart or reload the harness.
 ```
 
 ---

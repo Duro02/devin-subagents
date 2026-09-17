@@ -27,29 +27,21 @@ MCP 宿主 ──stdio/MCP──▶ devin-subagents ──stdio/ACP──▶ dev
 
 ### 手动安装
 
-1. **克隆与构建**：
-   ```bash
-   git clone https://github.com/Duro02/devin-subagents.git
-   cd devin-subagents
-   npm ci && npm run build
-   ```
-
-2. **注册 MCP Server**：
+1. **注册 MCP Server**：
    在宿主配置中添加（各宿主语法不同、语义等价）：
    ```json
    {
      "mcpServers": {
        "devin": {
-         "command": "node",
-         "args": ["/path/to/devin_subagents/dist/index.js"],
-         "cwd": "/path/to/devin_subagents"
+         "command": "npx",
+         "args": ["-y", "devin-subagents"]
        }
      }
    }
    ```
    > **注意**：server 的 `cwd` 决定 `.devin-subagents.json`（会话状态映射）与可选配置文件 `devin-subagents.config.json` 的解析路径。若宿主无法固定 `cwd`，请在 `args` 末尾追加 `--config /path/to/config.json`，并在配置中将 `statePath` 设为绝对路径。
 
-3. **安装 Skill**：
+2. **安装 Skill**：
    ```bash
    npx skills add Duro02/devin-subagents -g -a <harness>
    ```
@@ -62,10 +54,9 @@ MCP 宿主 ──stdio/MCP──▶ devin-subagents ──stdio/ACP──▶ dev
 ```text
 把 devin-subagents 装进你这台 harness——一个 stdio MCP server 加一个 skill，两样都要装。源码：https://github.com/Duro02/devin-subagents（本地已有克隆的话直接用）。
 
-1. clone 到稳定目录，在仓库目录里跑 `npm ci && npm run build`。
-2. 按你这台 harness 的惯例，注册名为 `devin` 的 stdio MCP server：`node <clone目录>/dist/index.js`，server 的 cwd 钉到 clone 目录。
-3. 装 skill：`npx skills add Duro02/devin-subagents -g -a <这台harness>`；不行就把 `skills/devin-subagents/` 复制/软链到它的用户级 skill 目录。
-4. 验证 MCP server 已注册、skill 可见，然后提示我重启/reload harness。
+1. 按你这台 harness 的惯例，注册名为 `devin` 的 stdio MCP server：`npx -y devin-subagents`。
+2. 装 skill：`npx skills add Duro02/devin-subagents -g -a <这台harness>`；不行就把 `skills/devin-subagents/` 复制/软链到它的用户级 skill 目录。
+3. 验证 MCP server 已注册、skill 可见，然后提示我重启/reload harness。
 ```
 
 ---
